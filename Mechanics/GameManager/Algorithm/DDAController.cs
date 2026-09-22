@@ -22,13 +22,16 @@ public class DDAController
     private int totalResponsesSubmitted = 0;
     public int TotalResponsesSubmitted => totalResponsesSubmitted;
 
-    private const int WIN_STREAK_THRESHOLD = 3;  // Exactly 3 correct answers required to increase tier
-    private const int LOSE_STREAK_THRESHOLD = 2; // 2 wrong/struggles to decrease tier
-    private const int N_MIN = 5;
+    public const int MIN_LEVEL = 1;
+    public const int MAX_LEVEL = 3;
+
+    private const int WIN_STREAK_THRESHOLD = 3;
+    private const int LOSE_STREAK_THRESHOLD = 2;
+    private const int N_MIN = 5;              // ported from ScaleDDAController
     private const float ALPHA_LOW = 0.4f;
     private const float ALPHA_HIGH = 0.8f;
 
-
+    public bool streakCanPromoteAtHighSuccess = false;
 
     private float GetStruggleTimeLimit() =>
         CurrentLevel == 1 ? 15f : CurrentLevel == 2 ? 25f : 40f;
@@ -45,14 +48,36 @@ public class DDAController
     public float LastSuccessRate { get; private set; } = 0f;
     public bool LastStruggled { get; private set; } = false;
 
+    // NEW — ported from ScaleDDAController: slow wrong answers are a strong signal.
+    public bool LastStruggledAndWrong { get; private set; } = false;
+
+    // ── PlayerPrefs keys ─────────────────────────────────────────────────────
+    private const string KEY_LEVEL = "DDA_Level";
+    private const string KEY_WIN = "DDA_WinStreak";
+    private const string KEY_LOSE = "DDA_LoseStreak";
+    private const string KEY_MA = "DDA_MABuffer";
+    private const string KEY_TOTAL_ATT = "DDA_TotalAttempts";
+    private const string KEY_TOTAL_CORRECT = "DDA_TotalCorrect";
+    private const string KEY_TOTAL_TIME = "DDA_TotalTime";
+    private const string KEY_TOTAL_RESP = "DDA_TotalResp";
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  RECORD AN ANSWER
+    // ─────────────────────────────────────────────────────────────────────────
     public void EvaluatePerformance(bool isCorrect, float timeSpent, string currentCategory, DifficultyNotifier notifier = null)
     {
+        Debug.Log($"[DDA] Current Difficulty: {CurrentLevel}");
+        Debug.Log($"[DDA] Recorded Answer: {(isCorrect ? "Correct" : "Incorrect")} ({timeSpent:F1}s)");
+
         TotalResponseTime += timeSpent;
         totalResponsesSubmitted++;
 
         float tLim = GetStruggleTimeLimit();
         bool struggled = isCorrect && (timeSpent > tLim);
+        bool struggledAndWrong = !isCorrect && (timeSpent > tLim);
+
         LastStruggled = struggled;
+        LastStruggledAndWrong = struggledAndWrong;
 
         totalQuestionsAttempted++;
         if (isCorrect) totalCorrectAnswers++;
@@ -75,7 +100,7 @@ public class DDAController
         {
             winStreak++;
             loseStreak = 0;
-            Debug.Log($"[DDA] Correct. WinStreak={winStreak}/3 L={loseStreak}");
+            Debug.Log($"[DDA] Correct. WinStreak={winStreak}/{WIN_STREAK_THRESHOLD} L={loseStreak}");
         }
         else if (isCorrect && struggled)
         {
@@ -89,10 +114,21 @@ public class DDAController
             if (!difficultyFailCount.ContainsKey(CurrentLevel))
                 difficultyFailCount[CurrentLevel] = 0;
             difficultyFailCount[CurrentLevel]++;
-            Debug.Log($"[DDA] Wrong. W={winStreak} L={loseStreak}");
+            Debug.Log($"[DDA] Wrong. W={winStreak} L={loseStreak} (struggled={struggledAndWrong})");
         }
 
         UpdateMovingAverageBuffer(isCorrect ? 1 : 0);
+
+        float ma = GetMovingAverage();
+        if (ma >= 0f)
+        {
+            Debug.Log($"[DDA] Moving Average: {ma:F2}");
+            Debug.Log($"[DDA] Success Rate: {ma * 100f:F0}%");
+        }
+        else
+        {
+            Debug.Log($"[DDA] Moving Average: not ready yet ({maBuffer.Count}/{MA_WINDOW_SIZE} answers)");
+        }
 
         if (TelemetryManager.Instance != null)
         {
@@ -115,49 +151,82 @@ public class DDAController
         int deltaL = 0;
         string reason = "No change";
 
-        // Strict 3/3 Milestone Rule Check
-        if (winStreak >= WIN_STREAK_THRESHOLD)
-        {
-            deltaL = +1;
-            reason = "Reached 3/3 correct streak milestone";
-            winStreak = 0; // Reset streak after successful tier shift
-        }
-        else if (loseStreak >= LOSE_STREAK_THRESHOLD)
+        float ma = GetMovingAverage();
+        bool maReady = ma >= 0f;
+        if (maReady) LastMovingAverage = ma;
+
+        if (loseStreak >= LOSE_STREAK_THRESHOLD)
         {
             deltaL = -1;
             reason = $"Lose streak reached {LOSE_STREAK_THRESHOLD}";
-            loseStreak = 0;
         }
-        else if (struggled && !isCorrect)
+        else if (maReady && ma <= ALPHA_LOW)
+        {
+            deltaL = -1;
+            reason = $"Success rate {ma * 100f:F0}% <= {ALPHA_LOW * 100f:F0}%";
+        }
+        else if (winStreak >= WIN_STREAK_THRESHOLD)
+        {
+            if (maReady && ma >= ALPHA_HIGH && !streakCanPromoteAtHighSuccess)
+            {
+                reason = $"3/3 streak reached, but success rate {ma * 100f:F0}% >= {ALPHA_HIGH * 100f:F0}% so difficulty holds";
+                winStreak = 0;
+            }
+            else
+            {
+                deltaL = +1;
+                reason = "Reached 3/3 correct streak milestone";
+            }
+        }
+        // NEW — ported from ScaleDDAController: N_MIN fallback while MA window fills
+        else if (!maReady && totalQuestionsAttempted >= N_MIN)
+        {
+            if (successRate < ALPHA_LOW && CurrentLevel > MIN_LEVEL)
+            {
+                deltaL = -1;
+                reason = $"Global success rate {successRate * 100f:F0}% < {ALPHA_LOW * 100f:F0}% (MA not yet full)";
+            }
+            else if (successRate > ALPHA_HIGH && CurrentLevel < MAX_LEVEL)
+            {
+                deltaL = +1;
+                reason = $"Global success rate {successRate * 100f:F0}% > {ALPHA_HIGH * 100f:F0}% (MA not yet full)";
+            }
+            else
+            {
+                reason = $"Success rate {successRate * 100f:F0}% between thresholds (MA not yet full): hold";
+            }
+        }
+        else if (maReady && ma >= ALPHA_HIGH)
+        {
+            reason = $"Success rate {ma * 100f:F0}% >= {ALPHA_HIGH * 100f:F0}%: hold";
+        }
+        else if (maReady)
+        {
+            reason = $"Success rate {ma * 100f:F0}% is between {ALPHA_LOW * 100f:F0}% and {ALPHA_HIGH * 100f:F0}%: hold";
+        }
+
+        // NEW — ported from ScaleDDAController: wrong-and-slow forces a drop
+        // if no higher-priority rule already fired.
+        if (deltaL == 0 && LastStruggledAndWrong && CurrentLevel > MIN_LEVEL)
         {
             deltaL = -1;
             reason = "Struggle detected on wrong answer";
-            loseStreak = 0;
-        }
-        else
-        {
-            float ma = GetMovingAverage();
-            if (ma >= 0f)
-            {
-                LastMovingAverage = ma;
-                if (ma < ALPHA_LOW)
-                {
-                    deltaL = -1;
-                    reason = $"MA={ma:P0} < α_low";
-                }
-                else if (ma > ALPHA_HIGH)
-                {
-                    deltaL = +1;
-                    reason = $"MA={ma:P0} > α_high";
-                }
-            }
         }
 
-        CurrentLevel = Mathf.Clamp(CurrentLevel + deltaL, 1, 3);
+        if (deltaL != 0)
+        {
+            winStreak = 0;
+            loseStreak = 0;
+        }
+
+        CurrentLevel = Mathf.Clamp(CurrentLevel + deltaL, MIN_LEVEL, MAX_LEVEL);
         LastDDADecision = reason;
 
         if (previousLevel != CurrentLevel)
         {
+            // Fresh evidence for the new tier
+            maBuffer.Clear();
+
             if (TelemetryManager.Instance != null)
                 TelemetryManager.Instance.RecordDifficultyChange();
 
@@ -167,16 +236,35 @@ public class DDAController
                 else notifier.ShowDecrease();
             }
 
-            Debug.Log($"[DDA] Difficulty Level shifted: Tier {previousLevel} -> Tier {CurrentLevel} | Reason: {reason}");
+            string verb = CurrentLevel > previousLevel ? "increased" : "decreased";
+            Debug.Log($"[DDA] Difficulty {verb}: {previousLevel} → {CurrentLevel} | Reason: {reason}");
+        }
+        else if (deltaL != 0)
+        {
+            Debug.Log($"[DDA] Difficulty remains: {CurrentLevel} (already at limit) | Reason: {reason}");
+        }
+        else
+        {
+            Debug.Log($"[DDA] Difficulty remains: {CurrentLevel} | Reason: {reason}");
         }
     }
 
     public void HandleTotalFailure()
     {
-        CurrentLevel = 1;
+        int previousLevel = CurrentLevel;
+
+        CurrentLevel = MIN_LEVEL;
         winStreak = 0;
         loseStreak++;
-        Debug.Log("[DDA] Total failure — reset level back to Tier 1.");
+
+        if (previousLevel != CurrentLevel)
+        {
+            maBuffer.Clear();
+            if (TelemetryManager.Instance != null)
+                TelemetryManager.Instance.RecordDifficultyChange();
+        }
+
+        Debug.Log($"[DDA] Total failure — difficulty {previousLevel} → {CurrentLevel} (Tier 1).");
     }
 
     private void UpdateMovingAverageBuffer(int binaryOutcome)
@@ -210,12 +298,60 @@ public class DDAController
 
     public float GetAverageResponsesPerQuestion()
     {
-        return totalQuestionsAttempted > 0 ? (float)totalResponsesSubmitted / totalQuestionsAttempted : 0f;
+        return totalQuestionsAttempted > 0
+            ? (float)totalResponsesSubmitted / totalQuestionsAttempted
+            : 0f;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    //  PERSISTENCE
+    // ─────────────────────────────────────────────────────────────────────────
+    public void SaveState()
+    {
+        PlayerPrefs.SetInt(KEY_LEVEL, CurrentLevel);
+        PlayerPrefs.SetInt(KEY_WIN, winStreak);
+        PlayerPrefs.SetInt(KEY_LOSE, loseStreak);
+        PlayerPrefs.SetString(KEY_MA, string.Join("", maBuffer));
+
+        PlayerPrefs.SetInt(KEY_TOTAL_ATT, totalQuestionsAttempted);
+        PlayerPrefs.SetInt(KEY_TOTAL_CORRECT, totalCorrectAnswers);
+        PlayerPrefs.SetFloat(KEY_TOTAL_TIME, TotalResponseTime);
+        PlayerPrefs.SetInt(KEY_TOTAL_RESP, totalResponsesSubmitted);
+
+        PlayerPrefs.Save();
+    }
+
+    public void LoadState()
+    {
+        if (!PlayerPrefs.HasKey(KEY_LEVEL)) return;
+
+        CurrentLevel = Mathf.Clamp(PlayerPrefs.GetInt(KEY_LEVEL, MIN_LEVEL), MIN_LEVEL, MAX_LEVEL);
+        winStreak = PlayerPrefs.GetInt(KEY_WIN, 0);
+        loseStreak = PlayerPrefs.GetInt(KEY_LOSE, 0);
+
+        maBuffer.Clear();
+        foreach (char c in PlayerPrefs.GetString(KEY_MA, ""))
+        {
+            if (c == '0' || c == '1') maBuffer.Enqueue(c == '1' ? 1 : 0);
+        }
+        while (maBuffer.Count > MA_WINDOW_SIZE) maBuffer.Dequeue();
+
+        totalQuestionsAttempted = PlayerPrefs.GetInt(KEY_TOTAL_ATT, 0);
+        totalCorrectAnswers = PlayerPrefs.GetInt(KEY_TOTAL_CORRECT, 0);
+        TotalResponseTime = PlayerPrefs.GetFloat(KEY_TOTAL_TIME, 0f);
+        totalResponsesSubmitted = PlayerPrefs.GetInt(KEY_TOTAL_RESP, 0);
+
+        Debug.Log($"[DDA] Restored difficulty: {CurrentLevel} (W={winStreak}, L={loseStreak}, " +
+                  $"MA window={maBuffer.Count}/{MA_WINDOW_SIZE}, " +
+                  $"Attempts={totalQuestionsAttempted}, Correct={totalCorrectAnswers}, " +
+                  $"TotalTime={TotalResponseTime:F1}, Responses={totalResponsesSubmitted})");
     }
 
     public void Reset()
     {
-        CurrentLevel = 1;
+        Debug.LogWarning($"[DDA] Reset() called — difficulty {CurrentLevel} → {MIN_LEVEL}");
+
+        CurrentLevel = MIN_LEVEL;
         winStreak = 0;
         loseStreak = 0;
         totalQuestionsAttempted = 0;
@@ -228,5 +364,7 @@ public class DDAController
         tierCorrect.Clear();
         tierAttempts = new Dictionary<int, int>() { { 1, 0 }, { 2, 0 }, { 3, 0 } };
         tierCorrect = new Dictionary<int, int>() { { 1, 0 }, { 2, 0 }, { 3, 0 } };
+
+        SaveState();
     }
 }
