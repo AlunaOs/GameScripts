@@ -1,6 +1,7 @@
 using UnityEngine;
 using System.Collections.Generic;
 using System.Linq;
+using UnityEngine.SceneManagement;
 
 public class GameManager : MonoBehaviour
 {
@@ -19,7 +20,6 @@ public class GameManager : MonoBehaviour
     private float sessionDuration = 0f;
     private int ddaAdjustmentCount = 0;
 
-    // Archived metrics for review in Main Scene after a run finishes
     private float lastRunDuration = 0f;
     private int lastRunDdaAdjustments = 0;
     private bool hasCompletedRun = false;
@@ -40,14 +40,29 @@ public class GameManager : MonoBehaviour
         DontDestroyOnLoad(gameObject);
 
         ddaController = new DDAController();
+        ddaController.LoadState();
         questionGenerator = new QuestionGenerator();
+
+        SceneManager.sceneLoaded += OnSceneLoaded;
 
         StartCoroutine(questionGenerator.LoadTemplates());
     }
 
+    void OnDestroy()
+    {
+        if (Instance == this)
+            SceneManager.sceneLoaded -= OnSceneLoaded;
+    }
+
+    private void OnSceneLoaded(Scene scene, LoadSceneMode mode)
+    {
+        if (ddaController == null) return;
+        Debug.Log($"[DDA] Scene loaded: {scene.name}");
+        Debug.Log($"[DDA] Restored difficulty: {ddaController.CurrentLevel}");
+    }
+
     void Update()
     {
-        // Only tick timer if we are actively inside a running dungeon session
         if (!hasCompletedRun)
         {
             questionTimer += Time.deltaTime;
@@ -55,14 +70,11 @@ public class GameManager : MonoBehaviour
         }
     }
 
-    /// <summary>
-    /// Called explicitly when the player enters a new dungeon. Freshly resets all DDA and timers.
-    /// </summary>
-    public void StartNewDungeonSession(string category)
+    public void StartNewDungeonSession(string category, bool resetDifficulty = false)
     {
         currentCategory = category;
 
-        if (ddaController != null)
+        if (ddaController != null && resetDifficulty)
         {
             ddaController.Reset();
         }
@@ -75,12 +87,9 @@ public class GameManager : MonoBehaviour
         PlayerPrefs.SetString(SAVE_CATEGORY, currentCategory);
         PlayerPrefs.Save();
 
-        Debug.Log($"[GameManager] New dungeon session started for '{category}'. DDA and timers reset to clean state.");
+        Debug.Log($"[GameManager] New dungeon session started for '{category}'. Timers reset. Difficulty {(resetDifficulty ? "RESET" : "kept")} at tier {ddaController.CurrentLevel}.");
     }
 
-    /// <summary>
-    /// Called when finishing a dungeon, locking in final results for Main Scene review.
-    /// </summary>
     public void CompleteDungeonSession()
     {
         lastRunDuration = sessionDuration;
@@ -98,19 +107,22 @@ public class GameManager : MonoBehaviour
 
     public void TrackQuestionPerformance(string questionText, int difficulty, bool isCorrect, float timeSpent)
     {
-        EvaluatePerformance(isCorrect, timeSpent > 0f ? timeSpent : questionTimer);
+        if (timeSpent < 0f) timeSpent = 0f;
+        EvaluatePerformance(isCorrect, timeSpent);
     }
 
     public Question GetQuestion()
     {
         questionTimer = 0f;
-        return questionGenerator.GetQuestion(ddaController.CurrentLevel, currentCategory);
+        int tier = ddaController.CurrentLevel;
+        Question q = questionGenerator.GetQuestion(tier, currentCategory);
+        Debug.Log($"[DDA] GetQuestion: requested tier {tier}, category '{currentCategory}', question difficulty = {(q != null ? q.difficulty.ToString() : "none")}");
+        return q;
     }
 
-    // Inside GameManager.cs
     public void EvaluatePerformance(bool isCorrect, float timeSpent = -1f)
     {
-        if (timeSpent <= 0f) timeSpent = questionTimer;
+        if (timeSpent < 0f) timeSpent = questionTimer;
 
         int oldLevel = ddaController.CurrentLevel;
         ddaController.EvaluatePerformance(isCorrect, timeSpent, currentCategory, difficultyNotifier);
@@ -141,6 +153,19 @@ public class GameManager : MonoBehaviour
     {
         PlayerPrefs.SetString(SAVE_CATEGORY, currentCategory);
         PlayerPrefs.Save();
+
+        if (ddaController != null)
+            ddaController.SaveState();
+    }
+
+    public void CommitDifficultyForNextStage(string nextSceneName)
+    {
+        if (ddaController == null) return;
+
+        Debug.Log("[DDA] Stage completed");
+        Debug.Log($"[DDA] Saving difficulty: {ddaController.CurrentLevel} (W={ddaController.WinStreak}, L={ddaController.LoseStreak}, MA={ddaController.GetMovingAverage():F2})");
+        ddaController.SaveState();
+        Debug.Log($"[DDA] Loading next stage '{nextSceneName}' with difficulty: {ddaController.CurrentLevel}");
     }
 
     public void LoadProgress()
@@ -155,7 +180,13 @@ public class GameManager : MonoBehaviour
     {
         if (ddaController != null)
         {
+            int oldLevel = ddaController.CurrentLevel;
             ddaController.HandleTotalFailure();
+
+            if (ddaController.CurrentLevel != oldLevel)
+                ddaAdjustmentCount++;
+
+            SaveProgress();
         }
     }
 
