@@ -7,6 +7,7 @@ public class Question
     public int difficulty;
     public string text;
     public string answer;
+    public string hint;
     public string explanation;
 }
 
