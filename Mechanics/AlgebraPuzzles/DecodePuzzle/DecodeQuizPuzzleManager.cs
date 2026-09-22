@@ -5,7 +5,7 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 
-public class DecodeQuizPuzzleManager : BasePuzzleManager
+public class DecodeQuizPuzzleManager : MonoBehaviour
 {
     [Header("UI References")]
     public TMP_Text stageText;
@@ -18,13 +18,15 @@ public class DecodeQuizPuzzleManager : BasePuzzleManager
     [Header("Panels & Animations")]
     public RectTransform questionPanel;
     public float panelSlideDuration = 0.5f;
-    private bool panelInitialPositionCached = false;
     private Vector2 questionPanelTargetPos;
+    private bool panelInitialPositionCached = false;
 
     [Header("Feedback Area Panels")]
     public GameObject correctPanel;
     public GameObject wrongPanel;
     public float feedbackDisplayDuration = 1.0f;
+
+    public GameObject characterUIControls;
 
     [Header("Button Containers")]
     public Transform answerButtonsContainer;
@@ -35,11 +37,28 @@ public class DecodeQuizPuzzleManager : BasePuzzleManager
     public Button undoButton;
     public Button closeButton;
 
-    [Header("Explanation Panel")]
+    // ── POST-ANSWER EXPLANATION CARD ────────────────────────────────────────
+    // Shown AFTER the player answers correctly. Contains the worked solution
+    // (can safely reveal the answer since the player already solved it).
+    [Header("Explanation Panel (post-answer card)")]
     public GameObject explanationPanel;
     public TMP_Text explanationAnswerText;
     public TMP_Text explanationBodyText;
     public Button gotItButton;
+
+    // ── HINT SYSTEM (separate from explanation) ─────────────────────────────
+    // Shown when the player presses the Hint button, BEFORE answering.
+    // Reads only the `hint` field — never `explanation`.
+    [Header("Hint Panel (separate canvas — reads only the 'hint' field)")]
+    public HintScrollUI hintScrollUI;
+    public GameObject hintExplanationPanel;
+    public TMP_Text hintExplanationText;
+    public Button hintGotItButton;
+
+    [Header("Star Reward Controller")]
+    public StarRewardAnimation starRewardAnimator;
+    public RectTransform[] targetStarSlots;
+    public GameObject objectToActivateOnCompletion;
 
     [Header("Progress Settings")]
     public int correctAnswersNeeded = 3;
@@ -47,16 +66,20 @@ public class DecodeQuizPuzzleManager : BasePuzzleManager
     public float stageCompleteDelay = 1.5f;
     public float submitCooldownTime = 0.5f;
 
-    // DDA Integration Object
-    private DDAController ddaController = new DDAController(DifficultyLevel.Easy);
-    public DifficultyLevel CurrentDifficulty => ddaController.CurrentDifficulty;
+    [HideInInspector]
+    public bool isCompleted = false;
+    private bool hintUsedThisQuiz = false;
 
     private QuestionGenerator questionGenerator = new QuestionGenerator();
+    [HideInInspector]
     public bool isDatasetLoaded => questionGenerator.IsLoaded;
 
+    // Private state
     private int correctAnswersCount = 0;
     private int currentQuestionAttempts = 0;
     private int stageCorrectCount = 0;
+    private float questionStartTime;
+    private int currentQuestionTier = 1;
 
     private Question currentQ;
     private List<string> currentAnswerPieces = new List<string>();
@@ -67,21 +90,22 @@ public class DecodeQuizPuzzleManager : BasePuzzleManager
 
     private bool isQuizActive = false;
     private bool isSubmitting = false;
+    private bool isProcessingAnswer = false;
     private float lastSubmitTime = 0f;
     private bool waitingForNext = false;
     private string saveKey;
 
-    protected override void Awake()
+    void Awake()
     {
-        base.Awake();
         saveKey = "DecodeQuizCompleted_" + gameObject.name;
 
         if (submitButton) submitButton.onClick.AddListener(SubmitAnswer);
         if (undoButton) undoButton.onClick.AddListener(UndoLastSelection);
-        if (closeButton) closeButton.onClick.AddListener(ClosePuzzle);
+        if (closeButton) closeButton.onClick.AddListener(OnCloseButtonPressed);
         if (gotItButton) gotItButton.onClick.AddListener(OnGotItClicked);
+        if (hintGotItButton) hintGotItButton.onClick.AddListener(HideHintExplanation);
 
-        if (questionPanel != null)
+        if (questionPanel != null && !panelInitialPositionCached)
         {
             questionPanelTargetPos = questionPanel.anchoredPosition;
             panelInitialPositionCached = true;
@@ -90,10 +114,15 @@ public class DecodeQuizPuzzleManager : BasePuzzleManager
         StartCoroutine(questionGenerator.LoadTemplates());
     }
 
-    protected override void Start()
+    void OnEnable()
     {
-        base.Start();
+        LoadQuizState();
+    }
+
+    void Start()
+    {
         HideExplanationPanel();
+        HideHintExplanation();
         HideFeedbackPanels();
         DisableHintButton();
     }
@@ -104,21 +133,30 @@ public class DecodeQuizPuzzleManager : BasePuzzleManager
             isSubmitting = false;
     }
 
-    public override void OpenPuzzle()
+    public void OnQuizOpened()
     {
-        if (isPuzzleCompleted) return;
-        base.OpenPuzzle();
+        if (isCompleted) return;
 
         StopAllCoroutines();
+
         isQuizActive = true;
         waitingForNext = false;
+        gameObject.SetActive(true);
+
+        if (characterUIControls != null)
+            characterUIControls.SetActive(false);
+
+        Cursor.lockState = CursorLockMode.None;
+        Cursor.visible = true;
 
         stageCorrectCount = 0;
         correctAnswersCount = 0;
-        isProcessingAction = false;
+        isProcessingAnswer = false;
         isSubmitting = false;
+        hintUsedThisQuiz = false;
 
         HideExplanationPanel();
+        HideHintExplanation();
         HideFeedbackPanels();
         DisableHintButton();
 
@@ -129,30 +167,58 @@ public class DecodeQuizPuzzleManager : BasePuzzleManager
                 questionPanelTargetPos = questionPanel.anchoredPosition;
                 panelInitialPositionCached = true;
             }
-            StartCoroutine(SlidePanelInRoutine(questionPanel, panelSlideDuration));
+            StartCoroutine(SlideInQuestionPanel());
         }
 
         StartCoroutine(InitializeQuiz());
     }
 
+    IEnumerator SlideInQuestionPanel()
+    {
+        float screenWidth = Screen.width;
+        Vector2 startPos = questionPanelTargetPos + new Vector2(screenWidth, 0);
+        questionPanel.anchoredPosition = startPos;
+
+        float elapsed = 0f;
+        while (elapsed < panelSlideDuration)
+        {
+            elapsed += Time.deltaTime;
+            float t = Mathf.Clamp01(elapsed / panelSlideDuration);
+            t = t * t * (3f - 2f * t);
+            questionPanel.anchoredPosition = Vector2.Lerp(startPos, questionPanelTargetPos, t);
+            yield return null;
+        }
+        questionPanel.anchoredPosition = questionPanelTargetPos;
+    }
+
     IEnumerator InitializeQuiz()
     {
-        while (!questionGenerator.IsLoaded) yield return null;
+        while (!questionGenerator.IsLoaded)
+        {
+            yield return null;
+        }
         ResetForNewQuestion();
     }
 
-    public override void ClosePuzzle()
+    public void CloseQuiz()
     {
+        StopAllCoroutines();
         isQuizActive = false;
-        isProcessingAction = false;
+        isProcessingAnswer = false;
         isSubmitting = false;
         waitingForNext = false;
         ResetAllState();
         HideExplanationPanel();
+        HideHintExplanation();
         HideFeedbackPanels();
         DisableHintButton();
 
-        base.ClosePuzzle();
+        if (characterUIControls != null)
+            characterUIControls.SetActive(true);
+
+        Cursor.lockState = CursorLockMode.Locked;
+        Cursor.visible = false;
+
         gameObject.SetActive(false);
     }
 
@@ -165,8 +231,9 @@ public class DecodeQuizPuzzleManager : BasePuzzleManager
         selectedButtons.Clear();
         foreach (var btn in activeButtons) Destroy(btn);
         activeButtons.Clear();
-        ddaController.Reset();
     }
+
+    public void OnCloseButtonPressed() => CloseQuiz();
 
     void ResetForNewQuestion()
     {
@@ -180,18 +247,22 @@ public class DecodeQuizPuzzleManager : BasePuzzleManager
         UpdateCurrentAnswerDisplay();
 
         currentQuestionAttempts = 0;
+        hintUsedThisQuiz = false;
         UpdateAttemptsDisplay();
 
         if (stageCompleteMessage) stageCompleteMessage.gameObject.SetActive(false);
         HideExplanationPanel();
+        HideHintExplanation();
         HideFeedbackPanels();
         DisableHintButton();
 
         if (questionGenerator.IsLoaded)
         {
-            int currentDiffTier = (int)ddaController.CurrentDifficulty;
-            currentQ = questionGenerator.GetQuestion(currentDiffTier, "Algebra");
-            puzzleStartTime = Time.time;
+            // DDA (through GameManager) is the single source of truth for difficulty.
+            currentQuestionTier = (GameManager.Instance != null) ? GameManager.Instance.currentLevel : 1;
+            currentQ = questionGenerator.GetQuestion(currentQuestionTier, "Algebra");
+            questionStartTime = Time.time;
+            Debug.Log($"[DDA] DecodeQuizPuzzleManager: requested tier {currentQuestionTier}, question difficulty = {(currentQ != null ? currentQ.difficulty.ToString() : "none")}");
         }
         else
         {
@@ -200,7 +271,7 @@ public class DecodeQuizPuzzleManager : BasePuzzleManager
 
         if (currentQ != null)
         {
-            if (stageText != null) stageText.text = $"DECODE CHALLENGE ({ddaController.CurrentDifficulty})";
+            if (stageText != null) stageText.text = "DECODE CHALLENGE";
             if (questionText) questionText.text = currentQ.text;
 
             ParseAnswerIntoPieces();
@@ -208,16 +279,21 @@ public class DecodeQuizPuzzleManager : BasePuzzleManager
             if (correctCounterText != null)
                 correctCounterText.text = $"Progress: {stageCorrectCount}/{correctAnswersNeeded}";
 
-            string activeTopic = (GameManager.Instance != null) ? GameManager.Instance.currentCategory : "Linear Equations and Inequalities";
-            LogPuzzleStart(activeTopic, (int)ddaController.CurrentDifficulty);
+            if (GameplayTelemetry.Instance != null)
+            {
+                string activeTopic = (GameManager.Instance != null) ? GameManager.Instance.currentCategory : "Linear Equations and Inequalities";
+                GameplayTelemetry.Instance.BeginPuzzle(activeTopic, currentQuestionTier);
+            }
         }
         else
         {
             if (questionText) questionText.text = "No questions found in dataset.";
+            Debug.LogError("[DecodeQuizPuzzleManager] currentQ is NULL from QuestionGenerator.");
         }
 
-        isProcessingAction = false;
+        isProcessingAnswer = false;
         isSubmitting = false;
+
         CheckAndUnlockHint();
     }
 
@@ -320,6 +396,7 @@ public class DecodeQuizPuzzleManager : BasePuzzleManager
             if (numericHindrances.Count >= 10) break;
         }
         allAnswerPieces.AddRange(numericHindrances);
+
         allAnswerPieces = allAnswerPieces.OrderBy(x => Random.value).ToList();
 
         foreach (string piece in allAnswerPieces)
@@ -336,7 +413,7 @@ public class DecodeQuizPuzzleManager : BasePuzzleManager
 
     void OnAnswerPieceClicked(Button clickedButton, string piece)
     {
-        if (isProcessingAction) return;
+        if (isProcessingAnswer) return;
         clickedButton.interactable = false;
         currentAnswerPieces.Add(piece);
         selectedButtons.Add(clickedButton);
@@ -345,7 +422,7 @@ public class DecodeQuizPuzzleManager : BasePuzzleManager
 
     public void UndoLastSelection()
     {
-        if (isProcessingAction || selectedButtons.Count == 0) return;
+        if (isProcessingAnswer || selectedButtons.Count == 0) return;
         Button last = selectedButtons[^1];
         last.interactable = true;
         selectedButtons.RemoveAt(selectedButtons.Count - 1);
@@ -361,57 +438,111 @@ public class DecodeQuizPuzzleManager : BasePuzzleManager
 
     public void SubmitAnswer()
     {
-        if (isProcessingAction || isSubmitting) return;
+        if (isProcessingAnswer || isSubmitting) return;
         if (Time.time - lastSubmitTime < submitCooldownTime) return;
         if (currentQ == null || currentAnswerPieces.Count == 0) return;
 
-        isProcessingAction = true;
+        isProcessingAnswer = true;
         isSubmitting = true;
         lastSubmitTime = Time.time;
 
-        float timeSpent = Time.time - puzzleStartTime;
+        float timeSpent = Time.time - questionStartTime;
         string playerAnswer = NormalizeAnswer(string.Join("", currentAnswerPieces));
         string correctAnswer = NormalizeAnswer(currentQ.answer);
         bool isCorrect = (playerAnswer == correctAnswer);
 
-        // CLEAN & DRY: Delegates telemetry and DDA cleanly
-        ddaController.EvaluateAnswer(isCorrect, timeSpent);
-        LogPuzzleAttempt(isCorrect, timeSpent);
+        if (GameplayTelemetry.Instance != null)
+        {
+            GameplayTelemetry.Instance.LogAttempt(isCorrect, timeSpent, hintUsedThisQuiz);
+        }
+
+        // Single source of truth for DDA + telemetry.
+        if (GameManager.Instance != null)
+        {
+            GameManager.Instance.TrackQuestionPerformance(
+                currentQ.text,
+                currentQuestionTier,
+                isCorrect,
+                timeSpent
+            );
+        }
 
         if (isCorrect)
+        {
             HandleCorrectAnswer();
+        }
         else
+        {
+            questionStartTime = Time.time;   // time each attempt separately
             HandleWrongAnswer();
+        }
     }
 
-    protected override void OnHintActivated()
+    // ── HINT SYSTEM (separate from explanation) ─────────────────────────────
+    public void CheckAndUnlockHint()
     {
-        ShowHintExplanation();
-        DisableHintButton();
+        if (ShopManagers.Instance != null && ShopManagers.Instance.hasHintScroll && !isCompleted)
+            EnableHintButton();
+        else
+            DisableHintButton();
+    }
+
+    public void EnableHintButton()
+    {
+        if (isCompleted) return;
+        if (hintScrollUI == null) return;
+
+        hintScrollUI.gameObject.SetActive(true);
+        hintScrollUI.EnableHint(() =>
+        {
+            if (ShopManagers.Instance != null)
+                ShopManagers.Instance.UseHintScroll();
+
+            ShowHintExplanation();
+            DisableHintButton();
+        });
+    }
+
+    public void DisableHintButton()
+    {
+        if (hintScrollUI != null)
+            hintScrollUI.gameObject.SetActive(false);
     }
 
     private void ShowHintExplanation()
     {
-        if (currentQ == null || explanationPanel == null) return;
-        explanationPanel.SetActive(true);
+        if (currentQ == null) return;
 
-        if (explanationAnswerText) explanationAnswerText.text = "Hint / Explanation";
-        if (explanationBodyText)
-        {
-            explanationBodyText.text = string.IsNullOrWhiteSpace(currentQ.explanation)
-                ? "No explanation available."
-                : currentQ.explanation;
-        }
+        hintUsedThisQuiz = true;
+
+        if (hintExplanationPanel != null)
+            hintExplanationPanel.SetActive(true);
+        string hintText = currentQ.hint;
+        if (string.IsNullOrWhiteSpace(hintText))
+            hintText = "Read the question carefully and identify the operation being asked.";
+
+        if (hintExplanationText != null)
+            hintExplanationText.text = hintText;
     }
+
+    public void HideHintExplanation()
+    {
+        if (hintExplanationPanel != null)
+            hintExplanationPanel.SetActive(false);
+    }
+    // ────────────────────────────────────────────────────────────────────────
 
     void HandleCorrectAnswer()
     {
         correctAnswersCount++;
         stageCorrectCount++;
 
-        int attemptsUsed = currentQuestionAttempts;
-        float accuracy = 1f - ((float)attemptsUsed / Mathf.Max(1, maxAttemptsPerQuestion - 1));
-        ProcessRankSuccess(accuracy);
+        if (RankManager.Instance != null)
+        {
+            int attemptsUsed = currentQuestionAttempts;
+            float accuracy = 1f - ((float)attemptsUsed / (maxAttemptsPerQuestion - 1));
+            RankManager.Instance.ProcessPuzzleSuccess(accuracy);
+        }
 
         if (correctCounterText != null)
             correctCounterText.text = $"Progress: {stageCorrectCount}/{correctAnswersNeeded}";
@@ -434,7 +565,9 @@ public class DecodeQuizPuzzleManager : BasePuzzleManager
     {
         currentQuestionAttempts++;
         UpdateAttemptsDisplay();
-        ProcessRankFailure();
+
+        if (RankManager.Instance != null)
+            RankManager.Instance.ProcessPuzzleFailure();
 
         if (currentQuestionAttempts >= maxAttemptsPerQuestion)
             StartCoroutine(DelayedNextQuestion(0.5f));
@@ -453,13 +586,17 @@ public class DecodeQuizPuzzleManager : BasePuzzleManager
         ResetCurrentAnswer();
     }
 
+    // This is the POST-ANSWER card. It is allowed to reveal the answer because
+    // the player already solved the question.
     void ShowExplanationPanel()
     {
         HideFeedbackPanels();
         if (explanationPanel == null) return;
         explanationPanel.SetActive(true);
 
-        if (explanationAnswerText) explanationAnswerText.text = "Answer:  " + currentQ.answer;
+        if (explanationAnswerText)
+            explanationAnswerText.text = "Answer:  " + currentQ.answer;
+
         if (explanationBodyText)
         {
             explanationBodyText.text = string.IsNullOrWhiteSpace(currentQ.explanation)
@@ -487,7 +624,7 @@ public class DecodeQuizPuzzleManager : BasePuzzleManager
         HideExplanationPanel();
 
         if (stageCorrectCount >= correctAnswersNeeded)
-            StartCoroutine(CompleteQuizAndCloseRoutine());
+            StartCoroutine(CompleteQuizAndClose());
         else
             ResetForNewQuestion();
     }
@@ -505,14 +642,23 @@ public class DecodeQuizPuzzleManager : BasePuzzleManager
         currentAnswerPieces.Clear();
         selectedButtons.Clear();
         UpdateCurrentAnswerDisplay();
-        isProcessingAction = false;
+        isProcessingAnswer = false;
+        isSubmitting = false;
     }
 
-    IEnumerator CompleteQuizAndCloseRoutine()
+    IEnumerator CompleteQuizAndClose()
     {
-        isPuzzleCompleted = true;
-        PlayerPrefs.SetInt(saveKey, 1);
-        PlayerPrefs.Save();
+        if (isCompleted)
+        {
+            CloseQuiz();
+            yield break;
+        }
+
+        isCompleted = true;
+        SaveQuizState();
+
+        if (ShopManagers.Instance != null)
+            ShopManagers.Instance.AddStars(1);
 
         if (stageCompleteMessage)
         {
@@ -520,13 +666,87 @@ public class DecodeQuizPuzzleManager : BasePuzzleManager
             stageCompleteMessage.gameObject.SetActive(true);
         }
 
-        bool sequenceFinished = false;
-        TriggerStarRewardSequence(() => sequenceFinished = true);
-        while (!sequenceFinished) yield return null;
+        bool starAnimationFinished = false;
+
+        if (starRewardAnimator != null && targetStarSlots != null && targetStarSlots.Length > 0)
+        {
+            RectTransform nextAvailableStarSlot = GetNextAvailableStarSlot();
+
+            if (nextAvailableStarSlot != null)
+            {
+                starRewardAnimator.PlayStarRewardSequence(nextAvailableStarSlot, () =>
+                {
+                    starAnimationFinished = true;
+                });
+
+                while (!starAnimationFinished)
+                    yield return null;
+            }
+        }
 
         yield return new WaitForSeconds(stageCompleteDelay);
+
         if (stageCompleteMessage) stageCompleteMessage.gameObject.SetActive(false);
 
-        ClosePuzzle();
+        CloseQuiz();
+
+        if (objectToActivateOnCompletion != null)
+            objectToActivateOnCompletion.SetActive(true);
+    }
+
+    private RectTransform GetNextAvailableStarSlot()
+    {
+        foreach (RectTransform starSlot in targetStarSlots)
+        {
+            if (starSlot == null) continue;
+
+            if (starSlot.childCount > 0)
+            {
+                if (!starSlot.GetChild(0).gameObject.activeSelf)
+                    return starSlot.childCount > 0 ? (RectTransform)starSlot.GetChild(0) : starSlot;
+            }
+            else if (!starSlot.gameObject.activeSelf)
+            {
+                return starSlot;
+            }
+        }
+
+        return targetStarSlots[targetStarSlots.Length - 1];
+    }
+
+    private void SaveQuizState()
+    {
+        PlayerPrefs.SetInt(saveKey, 1);
+        PlayerPrefs.Save();
+    }
+
+    private void LoadQuizState()
+    {
+        if (PlayerPrefs.HasKey(saveKey) && PlayerPrefs.GetInt(saveKey) == 1)
+        {
+            isCompleted = true;
+
+            if (objectToActivateOnCompletion != null)
+                objectToActivateOnCompletion.SetActive(true);
+        }
+    }
+
+    public void ResetQuizState()
+    {
+        PlayerPrefs.DeleteKey(saveKey);
+        isCompleted = false;
+        stageCorrectCount = 0;
+        correctAnswersCount = 0;
+        isQuizActive = false;
+        hintUsedThisQuiz = false;
+        ResetAllState();
+        DisableHintButton();
+        HideHintExplanation();
+        HideExplanationPanel();
+
+        if (objectToActivateOnCompletion != null)
+            objectToActivateOnCompletion.SetActive(false);
+
+        gameObject.SetActive(false);
     }
 }
