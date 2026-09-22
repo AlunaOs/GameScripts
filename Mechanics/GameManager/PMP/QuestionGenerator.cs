@@ -157,12 +157,18 @@ public class QuestionGenerator
 
         string explanation = GenerateExplanation(template, vars, answerText);
 
+        // ── NEW: build the hint string with the same token substitution as explanation.
+        // The hint panel reads this field — never the explanation — so the answer
+        // is never revealed before the player solves the question.
+        string hint = GenerateHint(template, vars);
+
         return new Question
         {
             category = template.topic,
             difficulty = template.difficulty,
             text = questionText,
             answer = answerText,
+            hint = hint,               // ← NEW
             explanation = explanation
         };
     }
@@ -231,6 +237,18 @@ public class QuestionGenerator
         exp = ReplaceSinglePlaceholders(exp, vars);
         exp = exp.Replace("[answer]", answerText);
         return exp;
+    }
+
+    // ── NEW: build the hint the same way we build the explanation.
+    // The hint NEVER contains the answer. It only guides.
+    private string GenerateHint(QuestionTemplate template, Dictionary<string, int> vars)
+    {
+        if (string.IsNullOrEmpty(template.hint)) return "";
+
+        string h = template.hint;
+        h = ResolveCompoundPlaceholders(h, vars);   // e.g. {a*b} → 12
+        h = ReplaceSinglePlaceholders(h, vars);     // e.g. {a} → 3
+        return h;
     }
 
     // =========================================================================
@@ -344,7 +362,15 @@ public class QuestionGenerator
     private Question CreateFallbackQuestion()
     {
         Debug.LogWarning("[QuestionGenerator] Using fallback question.");
-        return new Question { category = "Algebra", difficulty = 1, text = "What is 1 + 1?", answer = "2" };
+        return new Question
+        {
+            category = "Algebra",
+            difficulty = 1,
+            text = "What is 1 + 1?",
+            answer = "2",
+            hint = "Add the two numbers together.",
+            explanation = "1 + 1 = 2."
+        };
     }
 
     public void ResetHistory()
