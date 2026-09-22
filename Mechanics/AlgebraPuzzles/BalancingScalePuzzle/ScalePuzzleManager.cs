@@ -1,128 +1,162 @@
 using UnityEngine;
 using UnityEngine.UI;
+using UnityEngine.Networking;
 using TMPro;
+using System.IO;
 using System.Collections;
 using System.Collections.Generic;
-using System.IO;
-using UnityEngine.Networking;
 
-public class ScalePuzzleManager : BasePuzzleManager
+public class ScalePuzzleManager : MonoBehaviour
 {
-    [Header("Display Links")]
-    [SerializeField] private TextMeshProUGUI txtQuestionDisplay;
-    [SerializeField] private TextMeshProUGUI txtAttemptsDisplay;
-    [SerializeField] private TextMeshProUGUI txtCorrectDisplay;
-    [SerializeField] private GameObject puzzleCanvasPanel;
+    [Header("UI Display Links")]
+    public TextMeshProUGUI txtQuestionDisplay;
+    public TextMeshProUGUI txtAttemptsDisplay;
+    public TextMeshProUGUI txtCorrectDisplay;
 
-    [Header("Question Sliding Panel")]
+    [Header("Question Sliding Panel UI")]
     [SerializeField] private GameObject questionPanel;
     [SerializeField] private Button btnOpenQuestion;
     [SerializeField] private Button btnCloseQuestion;
     [SerializeField] private float questionAnimDuration = 0.3f;
 
-    [Header("Feedback System")]
+    [Tooltip("Drag the Master Balancing Scale Puzzle Canvas Panel here.")]
+    public GameObject puzzleCanvasPanel;
+    [Tooltip("Drag your Player Controls Canvas / On-screen Joystick UI object here.")]
+    public GameObject playerControlsCanvas;
+
+    [Header("Feedback Panel System")]
     [SerializeField] private GameObject feedbackPanel;
     [SerializeField] private TextMeshProUGUI feedbackText;
     [SerializeField] private GameObject iconCorrect;
     [SerializeField] private GameObject iconWrong;
     [SerializeField] private float feedbackDisplayDuration = 1.5f;
 
-    [Header("Pan Weights & Choices")]
-    [SerializeField] private TextMeshProUGUI txtLeftPanWeight;
-    [SerializeField] private TextMeshProUGUI txtRightPanWeight;
-    [SerializeField] private List<Button> choiceButtons = new List<Button>();
+    [Header("Pan Weight Texts")]
+    public TextMeshProUGUI txtLeftPanWeight;
+    public TextMeshProUGUI txtRightPanWeight;
 
-    [Header("Visual Feedback")]
-    [SerializeField] private Color colorBtnPress = new Color(0.8f, 0.9f, 1f, 1f);
-    [SerializeField] private Color colorCorrectHighlight = new Color(0f, 0.96f, 0.63f, 1f);
-    [SerializeField] private float buttonPressScale = 0.88f;
+    [Header("Choice Buttons")]
+    public List<Button> choiceButtons = new List<Button>();
 
-    [Header("Hint & Rewards")]
-    [SerializeField] private HintScrollUI hintScrollUI;
-    [SerializeField] private Transform movingBlock;
-    [SerializeField] private float targetRiseHeight = 5.0f;
-    [SerializeField] private float liftSpeed = 2.0f;
+    [Header("Button Visual Feedback Settings")]
+    public Color colorBtnPress = new Color(0.8f, 0.9f, 1f, 1f);
+    public Color colorCorrectHighlight = new Color(0f, 0.96f, 0.63f, 1f);
+    public float buttonPressScale = 0.88f;
 
-    [Header("Dataset & DDA")]
-    [SerializeField] private TextAsset puzzleDatasetJson;
-    [SerializeField] private string streamingAssetsFileName = "ScalePuzzleData.json";
+    [Header("Hint Prefab Reference")]
+    public HintScrollUI hintScrollUI;
+
+    [Header("Connected Moving Block Settings")]
+    public Transform movingBlock;
+    public float targetRiseHeight = 5.0f;
+    public float liftSpeed = 2.0f;
+
+    [Header("Vibration/Shake Settings")]
+    [SerializeField] private float shakeMagnitude = 15.0f;
+    [SerializeField] private float shakeDuration = 0.5f;
+
+    [Header("Star Reward Controller")]
+    public StarRewardAnimation starRewardAnimator;
+    public RectTransform[] targetStarSlots;
+
+    [Range(1, 3)]
+    public int starToRewardNumber = 1;
+
+    [Header("PMP Dataset")]
+    public TextAsset puzzleDatasetJson;
+    public string streamingAssetsFileName = "ScalePuzzleData.json";
+
+    [Header("DDA / PMP Settings")]
     [SerializeField] private int correctAnswersRequired = 3;
-    [SerializeField] private DifficultyNotifier difficultyNotifier;
+    public DifficultyNotifier difficultyNotifier;
 
-    private static readonly ScaleDDAController dda = new ScaleDDAController();
+    [HideInInspector]
+    public bool isCompleted = false;
+
+    // The shared DDA (inside GameManager) is the single source of truth.
+    // The old private ScaleDDAController has been removed.
     private static readonly ScaleQuestionGenerator generator = new ScaleQuestionGenerator();
 
     private ScaleQuestion currentQuestion;
+    private float questionStartTime;
     private int attemptsLeft = 3;
     private const int maxAttempts = 3;
     private int correctAnswersGiven = 0;
-    
-    private RectTransform questionRectTransform;
-    private Vector2 questionOriginalPos;
-    private Coroutine activeAnimCoroutine;
-    private Coroutine feedbackCoroutine;
+
     private Coroutine highlightCoroutine;
-    private bool isWaitingForNext = false;
+    private Coroutine feedbackCoroutine;
+    private bool isWaitingForNextQuestion = false;
+
+    private RectTransform questionRectTransform;
+    private Vector2 questionOriginalAnchoredPos;
+    private Coroutine questionAnimCoroutine;
+
+    private bool hintUsedThisPuzzle = false;
 
     private void Awake()
     {
         InitializeDataset();
         HideFeedbackPanel();
-        CachePanelRect();
-    }
 
-    private void Start()
-    {
-        btnOpenQuestion?.onClick.AddListener(OpenQuestionPanel);
-        btnCloseQuestion?.onClick.AddListener(CloseQuestionPanel);
-    }
-
-    private void CachePanelRect()
-    {
         if (questionPanel != null)
         {
             questionRectTransform = questionPanel.GetComponent<RectTransform>();
             if (questionRectTransform != null)
-                questionOriginalPos = questionRectTransform.anchoredPosition;
+                questionOriginalAnchoredPos = questionRectTransform.anchoredPosition;
         }
+    }
+
+    private void Start()
+    {
+        if (btnOpenQuestion != null) btnOpenQuestion.onClick.AddListener(OpenQuestionPanel);
+        if (btnCloseQuestion != null) btnCloseQuestion.onClick.AddListener(CloseQuestionPanel);
     }
 
     private void InitializeDataset()
     {
-        if (generator.IsLoaded) return;
-
-        if (puzzleDatasetJson != null)
+        if (!generator.IsLoaded)
         {
-            generator.LoadFromJson(puzzleDatasetJson.text);
-        }
-        else
-        {
-            StartCoroutine(LoadDatasetFromStreamingAssets());
+            if (puzzleDatasetJson != null)
+                generator.LoadFromJson(puzzleDatasetJson.text);
+            else
+                StartCoroutine(LoadDatasetFromStreamingAssets());
         }
     }
 
     private IEnumerator LoadDatasetFromStreamingAssets()
     {
         string path = Path.Combine(Application.streamingAssetsPath, streamingAssetsFileName);
-        using UnityWebRequest request = UnityWebRequest.Get(path);
-        yield return request.SendWebRequest();
 
-        if (request.result == UnityWebRequest.Result.Success)
+#if UNITY_ANDROID && !UNITY_EDITOR
+        using (UnityWebRequest request = UnityWebRequest.Get(path))
         {
-            generator.LoadFromJson(request.downloadHandler.text);
+            yield return request.SendWebRequest();
+            if (request.result == UnityWebRequest.Result.Success)
+                generator.LoadFromJson(request.downloadHandler.text);
+            else
+                Debug.LogError($"[ScalePuzzleManager] JSON load failed: {path} — {request.error}");
+        }
+#else
+        if (File.Exists(path))
+        {
+            string jsonText = File.ReadAllText(path);
+            generator.LoadFromJson(jsonText);
         }
         else
         {
-            Debug.LogError($"[ScalePuzzleManager] Dataset load failed: {request.error}");
+            Debug.LogError($"[ScalePuzzleManager] Missing file: {path}");
         }
+        yield return null;
+#endif
     }
 
     public void StartPuzzle()
     {
         if (isCompleted) return;
 
-        isWaitingForNext = false;
-        TogglePlayerControls(false);
+        isWaitingForNextQuestion = false;
+
+        if (playerControlsCanvas != null) playerControlsCanvas.SetActive(false);
         if (puzzleCanvasPanel != null) puzzleCanvasPanel.SetActive(true);
 
         StartCoroutine(StartPuzzleRoutine());
@@ -130,63 +164,119 @@ public class ScalePuzzleManager : BasePuzzleManager
 
     private IEnumerator StartPuzzleRoutine()
     {
-        while (!generator.IsLoaded) yield return null;
+        if (!generator.IsLoaded) InitializeDataset();
 
+        int timeoutFrames = 0;
+        while (!generator.IsLoaded && timeoutFrames < 100)
+        {
+            timeoutFrames++;
+            yield return null;
+        }
+
+        if (!generator.IsLoaded)
+        {
+            Debug.LogError("[ScalePuzzleManager] Failed to load puzzle dataset!");
+            yield break;
+        }
+
+        isWaitingForNextQuestion = false;
         attemptsLeft = maxAttempts;
-        GenerateNewQuestion(false);
+
+        if (currentQuestion == null)
+            GenerateNewQuestion(preferEasierVariant: false);
+        else
+        {
+            ApplyQuestionToUI();
+            questionStartTime = Time.time;
+        }
+
         UpdateStatusUI();
         SetButtonsInteractable(true);
         CheckAndUnlockHint();
         OpenQuestionPanel();
     }
 
-    public void OpenQuestionPanel() => TriggerPanelSlide(true);
-    public void CloseQuestionPanel() => TriggerPanelSlide(false);
-
-    private void TriggerPanelSlide(bool slideIn)
+    // ── QUESTION PANEL SLIDING ANIMATIONS ──────────────────────────────────────
+    public void OpenQuestionPanel()
     {
-        if (questionPanel == null || questionRectTransform == null) return;
-        if (activeAnimCoroutine != null) StopCoroutine(activeAnimCoroutine);
-        activeAnimCoroutine = StartCoroutine(SlidePanelRoutine(slideIn));
+        if (questionPanel != null && questionRectTransform != null)
+        {
+            if (questionAnimCoroutine != null) StopCoroutine(questionAnimCoroutine);
+            questionAnimCoroutine = StartCoroutine(SlideInQuestionPanel());
+        }
     }
 
-    private IEnumerator SlidePanelRoutine(bool slideIn)
+    public void CloseQuestionPanel()
     {
-        if (slideIn) questionPanel.SetActive(true);
-
-        float screenW = questionRectTransform.parent is RectTransform p ? p.rect.width : Screen.width;
-        Vector2 startPos = questionRectTransform.anchoredPosition;
-        Vector2 targetPos = slideIn ? questionOriginalPos : new Vector2(screenW, questionOriginalPos.y);
-
-        if (slideIn)
+        if (questionPanel != null && questionPanel.activeSelf && questionRectTransform != null)
         {
-            startPos = new Vector2(screenW, questionOriginalPos.y);
-            questionRectTransform.anchoredPosition = startPos;
+            if (questionAnimCoroutine != null) StopCoroutine(questionAnimCoroutine);
+            questionAnimCoroutine = StartCoroutine(SlideOutQuestionPanel());
         }
+    }
+
+    private IEnumerator SlideInQuestionPanel()
+    {
+        questionPanel.SetActive(true);
+
+        float offscreenX = Screen.width;
+        if (questionRectTransform.parent != null)
+            offscreenX = ((RectTransform)questionRectTransform.parent).rect.width;
+
+        Vector2 startPos = new Vector2(offscreenX, questionOriginalAnchoredPos.y);
+        Vector2 targetPos = questionOriginalAnchoredPos;
+        questionRectTransform.anchoredPosition = startPos;
 
         float elapsed = 0f;
         while (elapsed < questionAnimDuration)
         {
             elapsed += Time.deltaTime;
-            float t = Mathf.Clamp01(elapsed / questionAnimDuration);
-            t = t * t * (3f - 2f * t); // Smoothstep
+            float t = elapsed / questionAnimDuration;
+            t = t * t * (3f - 2f * t);
             questionRectTransform.anchoredPosition = Vector2.Lerp(startPos, targetPos, t);
             yield return null;
         }
-
         questionRectTransform.anchoredPosition = targetPos;
-        if (!slideIn) questionPanel.SetActive(false);
     }
 
-    private void GenerateNewQuestion(bool preferEasier)
+    private IEnumerator SlideOutQuestionPanel()
     {
-        currentQuestion = generator.GetNextQuestion(dda.CurrentDifficulty, preferEasier);
-        puzzleStartTime = Time.time;
-        hintUsed = false;
-        ApplyQuestionToUI();
+        float offscreenX = Screen.width;
+        if (questionRectTransform.parent != null)
+            offscreenX = ((RectTransform)questionRectTransform.parent).rect.width;
 
-        GameplayTelemetry.Instance?.BeginPuzzle("Linear Equations and Inequalities", (int)dda.CurrentDifficulty);
+        Vector2 startPos = questionRectTransform.anchoredPosition;
+        Vector2 targetPos = new Vector2(offscreenX, questionOriginalAnchoredPos.y);
+
+        float elapsed = 0f;
+        while (elapsed < questionAnimDuration)
+        {
+            elapsed += Time.deltaTime;
+            float t = elapsed / questionAnimDuration;
+            t = t * t * (3f - 2f * t);
+            questionRectTransform.anchoredPosition = Vector2.Lerp(startPos, targetPos, t);
+            yield return null;
+        }
+        questionRectTransform.anchoredPosition = targetPos;
+        questionPanel.SetActive(false);
     }
+
+private void GenerateNewQuestion(bool preferEasierVariant)
+{
+    int tier = (GameManager.Instance != null) ? GameManager.Instance.currentLevel : 1;
+
+    DifficultyLevel scaleTier = (DifficultyLevel)Mathf.Clamp(tier, 1, 3);
+
+    currentQuestion = generator.GetNextQuestion(scaleTier, preferEasierVariant);
+    questionStartTime = Time.time;
+    hintUsedThisPuzzle = false;
+    ApplyQuestionToUI();
+
+    Debug.Log($"[DDA] ScalePuzzleManager generated question for shared tier {tier} (enum={scaleTier})");
+
+    if (GameplayTelemetry.Instance != null)
+        GameplayTelemetry.Instance.BeginPuzzle("Linear Equations and Inequalities", tier);
+}
 
     private void ApplyQuestionToUI()
     {
@@ -200,32 +290,45 @@ public class ScalePuzzleManager : BasePuzzleManager
     private void ConfigureChoiceButtons(string[] options)
     {
         if (options == null || options.Length == 0) return;
+
         ResetChoiceButtonVisuals();
 
         string correct = currentQuestion.correctAnswer.Trim();
-        List<string> selected = new List<string> { correct };
-        
+        List<string> selectedOptions = new List<string> { correct };
+
         List<string> distractors = new List<string>();
         foreach (var opt in options)
         {
             string trimmed = opt.Trim();
-            if (trimmed != correct && !distractors.Contains(trimmed)) distractors.Add(trimmed);
+            if (trimmed != correct && !distractors.Contains(trimmed))
+                distractors.Add(trimmed);
         }
 
-        distractors.Shuffle();
-        for (int i = 0; i < Mathf.Min(3, distractors.Count); i++) selected.Add(distractors[i]);
-        selected.Shuffle();
+        for (int i = distractors.Count - 1; i > 0; i--)
+        {
+            int j = Random.Range(0, i + 1);
+            (distractors[i], distractors[j]) = (distractors[j], distractors[i]);
+        }
+
+        for (int i = 0; i < Mathf.Min(3, distractors.Count); i++)
+            selectedOptions.Add(distractors[i]);
+
+        for (int i = selectedOptions.Count - 1; i > 0; i--)
+        {
+            int j = Random.Range(0, i + 1);
+            (selectedOptions[i], selectedOptions[j]) = (selectedOptions[j], selectedOptions[i]);
+        }
 
         for (int i = 0; i < choiceButtons.Count; i++)
         {
             var btn = choiceButtons[i];
             if (btn == null) continue;
 
-            if (i < selected.Count)
+            if (i < selectedOptions.Count)
             {
                 btn.gameObject.SetActive(true);
                 btn.interactable = true;
-                BindButtonAction(btn, selected[i]);
+                ConfigureChoiceButton(btn, selectedOptions[i]);
             }
             else
             {
@@ -234,108 +337,176 @@ public class ScalePuzzleManager : BasePuzzleManager
         }
     }
 
-    private void BindButtonAction(Button btn, string label)
+    private void ConfigureChoiceButton(Button targetBtn, string label)
     {
-        btn.onClick.RemoveAllListeners();
-        if (btn.GetComponentInChildren<TMP_Text>() is TMP_Text tmp) tmp.text = label;
-        
-        Image img = btn.GetComponent<Image>();
-        btn.onClick.AddListener(() => StartCoroutine(AnimateTapAndVerify(btn.transform, img, label)));
+        targetBtn.onClick.RemoveAllListeners();
+
+        TMP_Text tmpText = targetBtn.GetComponentInChildren<TMP_Text>(true);
+        if (tmpText != null) tmpText.text = label;
+
+        Image btnImg = targetBtn.GetComponent<Image>();
+        Transform btnTransform = targetBtn.transform;
+
+        targetBtn.onClick.AddListener(() =>
+        {
+            if (gameObject.activeInHierarchy)
+                StartCoroutine(AnimateButtonTap(btnTransform, btnImg, () => VerifyAnswer(label)));
+            else
+                VerifyAnswer(label);
+        });
     }
 
-    private IEnumerator AnimateTapAndVerify(Transform tr, Image img, string label)
+    private IEnumerator AnimateButtonTap(Transform btnTransform, Image btnImage, System.Action onComplete)
     {
-        if (tr == null) { VerifyAnswer(label); yield break; }
+        if (btnTransform == null)
+        {
+            onComplete?.Invoke();
+            yield break;
+        }
 
-        Vector3 origScale = Vector3.one;
-        Color origColor = img != null ? img.color : Color.white;
-        if (img != null) img.color = colorBtnPress;
+        Vector3 originalScale = Vector3.one;
+        Vector3 pressedScale = originalScale * buttonPressScale;
+        Color originalColor = btnImage != null ? btnImage.color : Color.white;
 
         float elapsed = 0f;
-        while (elapsed < 0.05f)
+        float pressDuration = 0.05f;
+        if (btnImage != null) btnImage.color = colorBtnPress;
+
+        while (elapsed < pressDuration)
         {
             elapsed += Time.deltaTime;
-            tr.localScale = Vector3.Lerp(origScale, origScale * buttonPressScale, elapsed / 0.05f);
+            btnTransform.localScale = Vector3.Lerp(originalScale, pressedScale, elapsed / pressDuration);
             yield return null;
         }
 
         elapsed = 0f;
-        while (elapsed < 0.1f)
+        float bounceDuration = 0.1f;
+        while (elapsed < bounceDuration)
         {
             elapsed += Time.deltaTime;
-            tr.localScale = Vector3.Lerp(origScale * buttonPressScale, origScale, elapsed / 0.1f);
+            btnTransform.localScale = Vector3.Lerp(pressedScale, originalScale, elapsed / bounceDuration);
             yield return null;
         }
 
-        tr.localScale = origScale;
-        if (img != null) img.color = origColor;
+        btnTransform.localScale = originalScale;
+        if (btnImage != null) btnImage.color = originalColor;
 
-        VerifyAnswer(label);
+        onComplete?.Invoke();
     }
 
-    private void CheckAndUnlockHint()
+    public void CheckAndUnlockHint()
     {
-        if (ShopManagers.Instance != null && ShopManagers.Instance.hasHintScroll && !isCompleted && hintScrollUI != null)
+        if (ShopManagers.Instance != null && ShopManagers.Instance.hasHintScroll && !isCompleted)
+            EnableHintButton();
+    }
+
+    public void EnableHintButton()
+    {
+        if (isCompleted) return;
+        if (hintScrollUI == null) return;
+
+        hintScrollUI.EnableHint(() =>
         {
-            hintScrollUI.EnableHint(() =>
-            {
+            if (ShopManagers.Instance != null)
                 ShopManagers.Instance.UseHintScroll();
-                HighlightCorrectAnswer();
-            });
-        }
+
+            HighlightCorrectAnswer();
+        });
     }
 
-    private void HighlightCorrectAnswer()
+    public void HighlightCorrectAnswer()
     {
-        if (currentQuestion == null) return;
-        string target = currentQuestion.correctAnswer.Trim().ToLower();
+        if (currentQuestion == null || string.IsNullOrEmpty(currentQuestion.correctAnswer)) return;
 
-        foreach (var btn in choiceButtons)
+        string targetAnswer = currentQuestion.correctAnswer.Trim().ToLower();
+
+        foreach (Button btn in choiceButtons)
         {
             if (btn == null || !btn.gameObject.activeInHierarchy) continue;
-            if (btn.GetComponentInChildren<TMP_Text>()?.text.Trim().ToLower() == target)
+
+            string btnText = "";
+            TMP_Text tmp = btn.GetComponentInChildren<TMP_Text>();
+            if (tmp != null) btnText = tmp.text.Trim().ToLower();
+
+            if (btnText == targetAnswer)
             {
                 if (highlightCoroutine != null) StopCoroutine(highlightCoroutine);
-                highlightCoroutine = StartCoroutine(FlashButtonRoutine(btn));
-                hintUsed = true;
+                highlightCoroutine = StartCoroutine(FlashCorrectButtonRoutine(btn));
+                hintUsedThisPuzzle = true;
                 break;
             }
         }
     }
 
-    private IEnumerator FlashButtonRoutine(Button btn)
+    private IEnumerator FlashCorrectButtonRoutine(Button targetButton)
     {
-        Image img = btn.GetComponent<Image>();
-        if (img == null) yield break;
+        Image btnImg = targetButton.GetComponent<Image>();
+        if (btnImg == null) yield break;
 
-        for (int i = 0; i < 3; i++)
+        Color originalColor = Color.white;
+        try
         {
-            img.color = colorCorrectHighlight;
-            btn.transform.localScale = Vector3.one * 1.1f;
-            yield return new WaitForSeconds(0.25f);
-            img.color = Color.white;
-            btn.transform.localScale = Vector3.one;
-            yield return new WaitForSeconds(0.2f);
+            for (int i = 0; i < 3; i++)
+            {
+                btnImg.color = colorCorrectHighlight;
+                targetButton.transform.localScale = Vector3.one * 1.1f;
+                yield return new WaitForSeconds(0.25f);
+
+                btnImg.color = originalColor;
+                targetButton.transform.localScale = Vector3.one;
+                yield return new WaitForSeconds(0.2f);
+            }
+        }
+        finally
+        {
+            if (btnImg != null) btnImg.color = originalColor;
+            if (targetButton != null) targetButton.transform.localScale = Vector3.one;
         }
     }
 
     private void VerifyAnswer(string selectedValue)
     {
-        if (isWaitingForNew || currentQuestion == null) return;
+        if (isWaitingForNextQuestion || currentQuestion == null) return;
 
-        if (highlightCoroutine != null) { StopCoroutine(highlightCoroutine); highlightCoroutine = null; }
+        if (highlightCoroutine != null)
+        {
+            StopCoroutine(highlightCoroutine);
+            highlightCoroutine = null;
+        }
         ResetChoiceButtonVisuals();
 
-        float timeSpent = Time.time - puzzleStartTime;
-        bool isCorrect = selectedValue.Trim().Equals(currentQuestion.correctAnswer.Trim(), System.StringComparison.OrdinalIgnoreCase);
+        float timeSpent = Time.time - questionStartTime;
+        bool isCorrect = selectedValue.Trim() == currentQuestion.correctAnswer.Trim();
 
-        LogTelemetryAttempt(isCorrect, timeSpent);
-        GameManager.Instance?.TrackQuestionPerformance(currentQuestion.problemText, (int)dda.CurrentDifficulty, isCorrect, timeSpent);
-        GameManager.Instance?.EvaluatePerformance(isCorrect, timeSpent);
+        if (GameplayTelemetry.Instance != null)
+            GameplayTelemetry.Instance.LogAttempt(isCorrect, timeSpent, hintUsedThisPuzzle);
 
-        DifficultyLevel prevDiff = dda.CurrentDifficulty;
-        bool wantsEasier = dda.EvaluateAnswer(isCorrect, timeSpent);
-        NotifyDifficultyChange(prevDiff, dda.CurrentDifficulty);
+        // Capture tier BEFORE the shared DDA evaluates so we can fire the notifier.
+        int levelBefore = (GameManager.Instance != null) ? GameManager.Instance.currentLevel : 1;
+
+        if (GameManager.Instance != null)
+        {
+            // Single call — this drives the shared DDA, telemetry, persistence,
+            // and the ported wrong-and-slow penalty.
+            GameManager.Instance.TrackQuestionPerformance(
+                currentQuestion.problemText,
+                levelBefore,
+                isCorrect,
+                timeSpent
+            );
+        }
+
+        int levelAfter = (GameManager.Instance != null) ? GameManager.Instance.currentLevel : levelBefore;
+
+        if (levelBefore != levelAfter && difficultyNotifier != null)
+        {
+            if (levelAfter > levelBefore) difficultyNotifier.ShowIncrease();
+            else difficultyNotifier.ShowDecrease();
+        }
+
+        // Decide whether to pick an easier variant on the next question.
+        bool preferEasierVariant =
+            GameManager.Instance != null && GameManager.Instance.GetLoseStreak() >= 2;
 
         if (isCorrect)
         {
@@ -343,160 +514,256 @@ public class ScalePuzzleManager : BasePuzzleManager
             correctAnswersGiven++;
             attemptsLeft = maxAttempts;
             UpdateStatusUI();
-            RankManager.Instance?.ProcessPuzzleSuccess(dda.LastSuccessRate);
 
-            if (correctAnswersGiven >= correctAnswersRequired) CompletePuzzle();
-            else StartCoroutine(FeedbackRoutine(true, $"CORRECT! ({correctAnswersGiven}/{correctAnswersRequired})", () => GenerateNewQuestion(wantsEasier)));
+            if (RankManager.Instance != null)
+                RankManager.Instance.ProcessPuzzleSuccess(
+                    GameManager.Instance != null ? GameManager.Instance.GetSuccessRate() : 1f);
+
+            if (correctAnswersGiven >= correctAnswersRequired)
+                CompletePuzzle();
+            else
+                StartCoroutine(CorrectAnswerSequenceRoutine(preferEasierVariant));
         }
         else
         {
             attemptsLeft = Mathf.Max(0, attemptsLeft - 1);
             UpdateStatusUI();
-            RankManager.Instance?.ProcessPuzzleFailure();
 
-            if (attemptsLeft <= 0) StartCoroutine(HandleGameOverRoutine(wantsEasier));
-            else StartCoroutine(FeedbackRoutine(false, "WRONG ANSWER! TRY AGAIN...", () => SetButtonsInteractable(true)));
+            if (RankManager.Instance != null)
+                RankManager.Instance.ProcessPuzzleFailure();
+
+            if (attemptsLeft <= 0)
+                StartCoroutine(HandleOutOfAttemptsRoutine(preferEasierVariant));
+            else
+                StartCoroutine(WrongAnswerSequenceRoutine(preferEasierVariant));
         }
     }
 
-    private IEnumerator FeedbackRoutine(bool isCorrect, string msg, System.Action onComplete)
+    private IEnumerator HandleOutOfAttemptsRoutine(bool preferEasierVariant)
     {
-        isWaitingForNew = true;
+        isWaitingForNextQuestion = true;
         SetButtonsInteractable(false);
-        ShowFeedback(isCorrect, msg, feedbackDisplayDuration);
-        yield return new WaitForSeconds(feedbackDisplayDuration);
-        isWaitingForNew = false;
-        onComplete?.Invoke();
-        SetButtonsInteractable(true);
-    }
 
-    private IEnumerator HandleGameOverRoutine(bool wantsEasier)
-    {
-        isWaitingForNew = true;
-        SetButtonsInteractable(false);
-        ShowFeedback(false, "OUT OF ATTEMPTS! CLOSING...", 2.0f);
+        ShowFeedback(false, "OUT OF ATTEMPTS! CLOSING PUZZLE...", 2.0f);
         yield return new WaitForSeconds(2.0f);
-        GenerateNewQuestion(wantsEasier);
+
+        GenerateNewQuestion(preferEasierVariant);
         ClosePuzzle();
     }
 
     private void CompletePuzzle()
     {
+        // Re-entrancy guard: only reward once per completion.
+        if (isCompleted) return;
+
         isCompleted = true;
-        if (txtQuestionDisplay != null) txtQuestionDisplay.text = "<color=#00F5A0>SCALE BALANCED SUCCESSFULLY!</color>";
-        RewardPlayer();
 
-        StartCoroutine(CompleteSequenceRoutine());
-    }
+        if (txtQuestionDisplay != null)
+            txtQuestionDisplay.text = "<color=#00F5A0>SCALE BALANCED SUCCESSFULLY!</color>";
 
-    private IEnumerator CompleteSequenceRoutine()
-    {
-        bool animDone = false;
-        PlayStarRewardSequence(() => animDone = true);
-
-        float timer = 0f;
-        while (!animDone && timer < 2.0f) { timer += Time.deltaTime; yield return null; }
-
-        if (movingBlock != null)
+        if (ShopManagers.Instance != null)
         {
-            Vector3 targetPos = movingBlock.localPosition + new Vector3(0, targetRiseHeight, 0);
-            while (Vector3.Distance(movingBlock.localPosition, targetPos) > 0.01f)
-            {
-                movingBlock.localPosition = Vector3.MoveTowards(movingBlock.localPosition, targetPos, liftSpeed * Time.deltaTime);
-                yield return null;
-            }
+            ShopManagers.Instance.AddStars(1);
+            ShopManagers.Instance.LoadPlayerStars();
         }
-        ClosePuzzle();
+
+        StartCoroutine(CompletePuzzleSequenceRoutine());
     }
 
-    private void NotifyDifficultyChange(DifficultyLevel before, DifficultyLevel after)
+    IEnumerator CorrectAnswerSequenceRoutine(bool preferEasierVariant)
     {
-        if (before == after || difficultyNotifier == null) return;
-        if ((int)after > (int)before) difficultyNotifier.ShowIncrease();
-        else difficultyNotifier.ShowDecrease();
+        isWaitingForNextQuestion = true;
+
+        ShowFeedback(true, $"CORRECT! ({correctAnswersGiven}/{correctAnswersRequired})", feedbackDisplayDuration);
+        yield return new WaitForSeconds(feedbackDisplayDuration);
+
+        isWaitingForNextQuestion = false;
+        GenerateNewQuestion(preferEasierVariant);
+        SetButtonsInteractable(true);
+    }
+
+    IEnumerator WrongAnswerSequenceRoutine(bool preferEasierVariant)
+    {
+        isWaitingForNextQuestion = true;
+        SetButtonsInteractable(false);
+
+        ShowFeedback(false, "WRONG ANSWER! TRY AGAIN...", feedbackDisplayDuration);
+
+        Vector3 originalTextPosition = Vector3.zero;
+        if (txtQuestionDisplay != null)
+            originalTextPosition = txtQuestionDisplay.transform.localPosition;
+
+        float elapsed = 0f;
+        while (elapsed < shakeDuration)
+        {
+            elapsed += Time.deltaTime;
+            float randomX = Random.Range(-1f, 1f) * shakeMagnitude;
+            float randomY = Random.Range(-1f, 1f) * shakeMagnitude;
+
+            if (txtQuestionDisplay != null)
+                txtQuestionDisplay.transform.localPosition = originalTextPosition + new Vector3(randomX, randomY, 0f);
+
+            yield return null;
+        }
+
+        if (txtQuestionDisplay != null)
+            txtQuestionDisplay.transform.localPosition = originalTextPosition;
+
+        float remainingDelay = Mathf.Max(0f, feedbackDisplayDuration - shakeDuration);
+        yield return new WaitForSeconds(remainingDelay);
+
+        isWaitingForNextQuestion = false;
+        SetButtonsInteractable(true);
     }
 
     private void UpdateStatusUI()
     {
-        if (txtAttemptsDisplay != null) txtAttemptsDisplay.text = $"ATTEMPTS: {attemptsLeft}/{maxAttempts}";
-        if (txtCorrectDisplay != null) txtCorrectDisplay.text = $"CORRECT: {correctAnswersGiven}/{correctAnswersRequired}";
+        if (txtAttemptsDisplay != null)
+            txtAttemptsDisplay.text = $"ATTEMPTS: {attemptsLeft}/{maxAttempts}";
+
+        if (txtCorrectDisplay != null)
+            txtCorrectDisplay.text = $"CORRECT: {correctAnswersGiven}/{correctAnswersRequired}";
     }
 
-    private void ShowFeedback(bool correct, string msg, float duration)
+    public void ShowFeedback(bool isCorrect, string message, float duration)
     {
-        if (feedbackCoroutine != null) StopCoroutine(feedbackCoroutine);
-        feedbackCoroutine = StartCoroutine(DisplayFeedbackRoutine(correct, msg, duration));
+        if (feedbackCoroutine != null)
+            StopCoroutine(feedbackCoroutine);
+
+        feedbackCoroutine = StartCoroutine(DisplayFeedbackRoutine(isCorrect, message, duration));
     }
 
-    private IEnumerator DisplayFeedbackRoutine(bool correct, string msg, float duration)
+    private IEnumerator DisplayFeedbackRoutine(bool isCorrect, string message, float duration)
     {
         if (feedbackPanel == null) yield break;
+
         feedbackPanel.SetActive(true);
-        if (feedbackText != null) feedbackText.text = msg;
-        if (iconCorrect != null) iconCorrect.SetActive(correct);
-        if (iconWrong != null) iconWrong.SetActive(!correct);
+
+        if (feedbackText != null)
+            feedbackText.text = message;
+
+        if (iconCorrect != null) iconCorrect.SetActive(isCorrect);
+        if (iconWrong != null) iconWrong.SetActive(!isCorrect);
+
         yield return new WaitForSeconds(duration);
         HideFeedbackPanel();
     }
 
-    private void HideFeedbackPanel()
+    public void HideFeedbackPanel()
     {
-        feedbackPanel?.SetActive(false);
-        iconCorrect?.SetActive(false);
-        iconWrong?.SetActive(false);
+        if (feedbackPanel != null) feedbackPanel.SetActive(false);
+        if (iconCorrect != null) iconCorrect.SetActive(false);
+        if (iconWrong != null) iconWrong.SetActive(false);
+    }
+
+    IEnumerator CompletePuzzleSequenceRoutine()
+    {
+        bool isStarAnimationDone = false;
+
+        if (starRewardAnimator != null)
+        {
+            int arrayIndex = Mathf.Clamp(starToRewardNumber - 1, 0, targetStarSlots.Length - 1);
+
+            if (targetStarSlots != null && targetStarSlots.Length > arrayIndex && targetStarSlots[arrayIndex] != null)
+                starRewardAnimator.PlayStarRewardSequence(targetStarSlots[arrayIndex], () => isStarAnimationDone = true);
+            else
+                starRewardAnimator.PlayStarRewardSequence(() => isStarAnimationDone = true);
+        }
+        else
+        {
+            isStarAnimationDone = true;
+        }
+
+        float timeoutTimer = 0f;
+        while (!isStarAnimationDone && timeoutTimer < 2.0f)
+        {
+            timeoutTimer += Time.deltaTime;
+            yield return null;
+        }
+
+        if (movingBlock != null)
+        {
+            Vector3 startPosition = movingBlock.localPosition;
+            Vector3 targetPosition = startPosition + new Vector3(0, targetRiseHeight, 0);
+
+            if (liftSpeed <= 0f) liftSpeed = 2.0f;
+
+            while (Vector3.Distance(movingBlock.localPosition, targetPosition) > 0.01f)
+            {
+                movingBlock.localPosition = Vector3.MoveTowards(
+                    movingBlock.localPosition, targetPosition, liftSpeed * Time.deltaTime);
+                yield return null;
+            }
+
+            movingBlock.localPosition = targetPosition;
+        }
+
+        ClosePuzzle();
     }
 
     private void SetButtonsInteractable(bool state)
     {
-        foreach (var btn in choiceButtons) if (btn != null) btn.interactable = state;
+        foreach (var btn in choiceButtons)
+            if (btn != null) btn.interactable = state;
     }
 
-    private void ResetChoiceButtonVisuals()
+    public void ResetChoiceButtonVisuals()
     {
         foreach (var btn in choiceButtons)
         {
             if (btn == null) continue;
-            if (btn.GetComponent<Image>() is Image img) img.color = Color.white;
+
+            Image btnImg = btn.GetComponent<Image>();
+            if (btnImg != null) btnImg.color = Color.white;
+
             btn.transform.localScale = Vector3.one;
         }
     }
 
-    public override void ClosePuzzle()
-    {
-        if (highlightCoroutine != null) { StopCoroutine(highlightCoroutine); highlightCoroutine = null; }
-        ResetChoiceButtonVisuals();
-        HideFeedbackPanel();
-        isWaitingForNew = false;
-        TriggerPanelSlide(false);
-        puzzleCanvasPanel?.SetActive(false);
-        TogglePlayerControls(true);
-    }
-
-    public override void ResetPuzzleState()
+    public void ResetPuzzleState()
     {
         attemptsLeft = maxAttempts;
         correctAnswersGiven = 0;
         currentQuestion = null;
-        isWaitingForNew = false;
+        isWaitingForNextQuestion = false;
+        isCompleted = false;
+
+        if (highlightCoroutine != null)
+        {
+            StopCoroutine(highlightCoroutine);
+            highlightCoroutine = null;
+        }
+
         ResetChoiceButtonVisuals();
         SetButtonsInteractable(true);
         HideFeedbackPanel();
         UpdateStatusUI();
     }
-}
 
-// Extension helper for list shuffling
-public static class ListExtensions
-{
-    private static readonly System.Random rng = new System.Random();
-    public static void Shuffle<T>(this IList<T> list)
+    public void ClosePuzzle()
     {
-        int n = list.Count;
-        while (n > 1)
+        if (highlightCoroutine != null)
         {
-            n--;
-            int k = rng.Next(n + 1);
-            (list[k], list[n]) = (list[n], list[k]);
+            StopCoroutine(highlightCoroutine);
+            highlightCoroutine = null;
         }
+
+        ResetChoiceButtonVisuals();
+        HideFeedbackPanel();
+        isWaitingForNextQuestion = false;
+
+        if (questionPanel != null && questionPanel.activeSelf && questionRectTransform != null)
+        {
+            if (questionAnimCoroutine != null) StopCoroutine(questionAnimCoroutine);
+            questionAnimCoroutine = StartCoroutine(SlideOutQuestionPanel());
+        }
+
+        if (playerControlsCanvas != null) playerControlsCanvas.SetActive(true);
+        if (puzzleCanvasPanel != null) puzzleCanvasPanel.SetActive(false);
+    }
+
+    public void RestorePlayerControls()
+    {
+        if (playerControlsCanvas != null) playerControlsCanvas.SetActive(true);
     }
 }
