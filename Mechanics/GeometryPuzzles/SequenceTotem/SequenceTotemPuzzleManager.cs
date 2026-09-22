@@ -5,12 +5,10 @@ using UnityEngine;
 using UnityEngine.UI;
 using TMPro;
 
-/// <summary>
-/// Manages the Sequence Totem interactive puzzle system, extending BasePuzzleManager
-/// to handle state-machine question tracking, totem rotation selection, and moving gate logic.
-/// </summary>
-public class SequenceTotemPuzzleManager : BasePuzzleManager
+public class SequenceTotemPuzzleManager : MonoBehaviour
 {
+    public bool isCleared = false;
+
     [Header("Data & Difficulty")]
     [SerializeField] private PuzzleLoader puzzleLoader;
     [SerializeField] private string currentDifficulty = "easy";
@@ -47,73 +45,88 @@ public class SequenceTotemPuzzleManager : BasePuzzleManager
     [Header("Per-Question Attempts")]
     [SerializeField] private int maxAttemptsPerQuestion = 3;
 
+    [Header("Player Movement HUD")]
+    [SerializeField] private GameObject playerControlsCanvas;
+
+    [Header("Reward & Star Animations")]
+    public StarRewardAnimation starRewardAnimator;
+    public RectTransform targetStarSlot;
+
+    // ── HINT SYSTEM (separate canvas — reads only the 'hint' field) ─────────
+    [Header("Hint Panel (separate canvas — reads only the 'hint' field)")]
+    public HintScrollUI hintScrollUI;
+    public GameObject hintExplanationPanel;
+    public TMP_Text hintExplanationText;
+    public Button hintGotItButton;
+
     private List<PuzzleItem> activeSessionPuzzles = new List<PuzzleItem>();
     private List<int> randomizedTotemIndices = new List<int> { 0, 1, 2 };
     private int currentQuestionIndex = 0;
     private int questionAttemptsRemaining;
     private bool datasetLoaded = false;
+    private bool isSubmitting = false;
+    private bool hintUsedThisPuzzle = false;
     private Coroutine currentFeedbackCoroutine;
+    private float questionStartTime;
 
-    // Moving Wall Variables
     private Vector3 initialWallPosition;
     private bool isWallMoving = false;
 
-    // Question Panel Transition Variables
     private RectTransform questionRectTransform;
+    private Vector2 questionOriginalAnchoredPos;
+    private Coroutine questionAnimCoroutine;
 
-    protected override void Awake()
+    private void Awake()
     {
-        base.Awake();
-
-        if (movingWall != null)
-        {
-            initialWallPosition = movingWall.position;
-        }
+        if (movingWall != null) initialWallPosition = movingWall.position;
 
         if (questionPanel != null)
         {
             questionRectTransform = questionPanel.GetComponent<RectTransform>();
+            if (questionRectTransform != null)
+                questionOriginalAnchoredPos = questionRectTransform.anchoredPosition;
         }
     }
 
-    protected override void Start()
+    private void Start()
     {
-        base.Start();
-
         if (submitButton != null) submitButton.onClick.AddListener(SubmitCurrentAnswer);
         if (closePanelButton != null) closePanelButton.onClick.AddListener(ClosePuzzleManually);
         if (btnOpenQuestion != null) btnOpenQuestion.onClick.AddListener(OpenQuestionPanel);
         if (btnCloseQuestion != null) btnCloseQuestion.onClick.AddListener(CloseQuestionPanel);
+        if (hintGotItButton != null) hintGotItButton.onClick.AddListener(HideHintExplanation);
 
         HideFeedback();
+        HideHintExplanation();
+        DisableHintButton();
     }
 
     public void StartPuzzleSystem()
     {
-        if (isPuzzleCompleted) return;
+        if (isCleared) return;
 
-        OpenPuzzle();
+        if (playerControlsCanvas != null) playerControlsCanvas.SetActive(false);
 
         if (!datasetLoaded)
         {
             PrepareSessionQuestions();
         }
 
-        string puzzleTopic = (GameManager.Instance != null && !string.IsNullOrEmpty(GameManager.Instance.currentCategory))
-            ? GameManager.Instance.currentCategory
-            : "Geometry Sequences";
-
-        int diffLevel = currentDifficulty.ToLower() == "hard" ? 3 : (currentDifficulty.ToLower() == "medium" ? 2 : 1);
-        LogPuzzleStart(puzzleTopic, diffLevel);
-        
         if (GameplayTelemetry.Instance != null)
         {
+            string puzzleTopic = (GameManager.Instance != null && !string.IsNullOrEmpty(GameManager.Instance.currentCategory))
+                ? GameManager.Instance.currentCategory
+                : "Geometry Sequences";
+
+            int diffLevel = currentDifficulty.ToLower() == "hard" ? 3 : (currentDifficulty.ToLower() == "medium" ? 2 : 1);
+            GameplayTelemetry.Instance.BeginPuzzle(puzzleTopic, diffLevel);
             GameplayTelemetry.Instance.LogQuestionTier(diffLevel);
             GameplayTelemetry.Instance.LogAttemptNumber(1);
         }
 
         DisplayCurrentQuestion();
         OpenQuestionPanel();
+        CheckAndUnlockHint();
     }
 
     private void PrepareSessionQuestions()
@@ -121,9 +134,7 @@ public class SequenceTotemPuzzleManager : BasePuzzleManager
         if (puzzleLoader == null) puzzleLoader = GetComponent<PuzzleLoader>();
 
         if (puzzleLoader != null && puzzleLoader.Database == null)
-        {
             puzzleLoader.LoadData();
-        }
 
         if (puzzleLoader == null || puzzleLoader.Database == null)
         {
@@ -180,21 +191,25 @@ public class SequenceTotemPuzzleManager : BasePuzzleManager
     {
         if (activeSessionPuzzles.Count < 3) return;
 
-        puzzleStartTime = Time.time;
+        questionStartTime = Time.time;
+        hintUsedThisPuzzle = false;
 
         int activeTotemIndex = randomizedTotemIndices[currentQuestionIndex];
         char totemLabel = (char)('A' + activeTotemIndex);
 
-        if (questionText != null) questionText.text = activeSessionPuzzles[currentQuestionIndex].question;
-        if (progressText != null) progressText.text = $"Question {currentQuestionIndex + 1}/3";
-        if (guideText != null) guideText.text = $"Rotate Totem {totemLabel} by touching them to match the answer. Every totem you see a have a corresponding count of Dead Bush, what could those Dead Bush represent? can you identify them?";
+        if (questionText != null)
+            questionText.text = activeSessionPuzzles[currentQuestionIndex].question;
+
+        if (progressText != null)
+            progressText.text = $"Question {currentQuestionIndex + 1}/3";
+
+        if (guideText != null)
+            guideText.text = $"Rotate Totem {totemLabel} by touching them to match the answer.";
 
         UpdateAttemptsUI();
 
         for (int i = 0; i < totems.Length; i++)
-        {
             totems[i].SetActiveState(i == activeTotemIndex);
-        }
 
         if (GameplayTelemetry.Instance != null)
         {
@@ -202,15 +217,17 @@ public class SequenceTotemPuzzleManager : BasePuzzleManager
             GameplayTelemetry.Instance.LogQuestionTier(diffLevel);
             GameplayTelemetry.Instance.LogAttemptNumber(maxAttemptsPerQuestion - questionAttemptsRemaining + 1);
         }
+
+        // Refresh hint button visibility for the new question
+        CheckAndUnlockHint();
     }
 
     public void OpenQuestionPanel()
     {
-        if (questionRectTransform != null)
+        if (questionPanel != null && questionRectTransform != null)
         {
-            if (panelAnimCoroutine != null) StopCoroutine(panelAnimCoroutine);
-            questionPanel.SetActive(true);
-            panelAnimCoroutine = StartCoroutine(SlidePanelInRoutine(questionRectTransform, questionAnimDuration));
+            if (questionAnimCoroutine != null) StopCoroutine(questionAnimCoroutine);
+            questionAnimCoroutine = StartCoroutine(SlideInQuestionPanel());
         }
     }
 
@@ -218,9 +235,55 @@ public class SequenceTotemPuzzleManager : BasePuzzleManager
     {
         if (questionPanel != null && questionPanel.activeSelf && questionRectTransform != null)
         {
-            if (panelAnimCoroutine != null) StopCoroutine(panelAnimCoroutine);
-            panelAnimCoroutine = StartCoroutine(SlidePanelOutRoutine(questionRectTransform, questionPanel, questionAnimDuration));
+            if (questionAnimCoroutine != null) StopCoroutine(questionAnimCoroutine);
+            questionAnimCoroutine = StartCoroutine(SlideOutQuestionPanel());
         }
+    }
+
+    private IEnumerator SlideInQuestionPanel()
+    {
+        questionPanel.SetActive(true);
+
+        float offscreenX = Screen.width;
+        if (questionRectTransform.parent != null)
+            offscreenX = ((RectTransform)questionRectTransform.parent).rect.width;
+
+        Vector2 startPos = new Vector2(offscreenX, questionOriginalAnchoredPos.y);
+        Vector2 targetPos = questionOriginalAnchoredPos;
+        questionRectTransform.anchoredPosition = startPos;
+
+        float elapsed = 0f;
+        while (elapsed < questionAnimDuration)
+        {
+            elapsed += Time.deltaTime;
+            float t = elapsed / questionAnimDuration;
+            t = t * t * (3f - 2f * t);
+            questionRectTransform.anchoredPosition = Vector2.Lerp(startPos, targetPos, t);
+            yield return null;
+        }
+        questionRectTransform.anchoredPosition = targetPos;
+    }
+
+    private IEnumerator SlideOutQuestionPanel()
+    {
+        float offscreenX = Screen.width;
+        if (questionRectTransform.parent != null)
+            offscreenX = ((RectTransform)questionRectTransform.parent).rect.width;
+
+        Vector2 startPos = questionRectTransform.anchoredPosition;
+        Vector2 targetPos = new Vector2(offscreenX, questionOriginalAnchoredPos.y);
+
+        float elapsed = 0f;
+        while (elapsed < questionAnimDuration)
+        {
+            elapsed += Time.deltaTime;
+            float t = elapsed / questionAnimDuration;
+            t = t * t * (3f - 2f * t);
+            questionRectTransform.anchoredPosition = Vector2.Lerp(startPos, targetPos, t);
+            yield return null;
+        }
+        questionRectTransform.anchoredPosition = targetPos;
+        questionPanel.SetActive(false);
     }
 
     private void ResetQuestionAttempts()
@@ -228,24 +291,20 @@ public class SequenceTotemPuzzleManager : BasePuzzleManager
         questionAttemptsRemaining = maxAttemptsPerQuestion;
         UpdateAttemptsUI();
         if (GameplayTelemetry.Instance != null)
-        {
             GameplayTelemetry.Instance.LogAttemptNumber(1);
-        }
     }
 
     private void UpdateAttemptsUI()
     {
         if (attemptsText != null)
-        {
             attemptsText.text = $"Attempts: {questionAttemptsRemaining}/{maxAttemptsPerQuestion}";
-        }
     }
 
     public void SubmitCurrentAnswer()
     {
-        if (isPuzzleCompleted || isProcessingAction || activeSessionPuzzles.Count < 3) return;
+        if (isCleared || isSubmitting || activeSessionPuzzles.Count < 3) return;
 
-        float timeSpent = Time.time - puzzleStartTime;
+        float timeSpent = Time.time - questionStartTime;
         int activeTotemIndex = randomizedTotemIndices[currentQuestionIndex];
         float playerSelection = totems[activeTotemIndex].SelectedValue;
         float targetAnswer = activeSessionPuzzles[currentQuestionIndex].correctAnswer;
@@ -254,12 +313,16 @@ public class SequenceTotemPuzzleManager : BasePuzzleManager
         bool isCorrect = Mathf.Abs(playerSelection - targetAnswer) < 0.01f;
         int currentAttemptNumber = maxAttemptsPerQuestion - questionAttemptsRemaining + 1;
 
-        LogPuzzleAttempt(isCorrect, timeSpent);
-        TrackQuestionMetrics(currentQuestionText, 1, isCorrect, timeSpent);
-
         if (GameplayTelemetry.Instance != null)
         {
             GameplayTelemetry.Instance.LogAttemptNumber(currentAttemptNumber);
+            GameplayTelemetry.Instance.LogAttempt(isCorrect, timeSpent, hintUsedThisPuzzle);
+        }
+
+        if (GameManager.Instance != null)
+        {
+            // Single call — TrackQuestionPerformance already runs EvaluatePerformance internally.
+            GameManager.Instance.TrackQuestionPerformance(currentQuestionText, 1, isCorrect, timeSpent);
         }
 
         if (isCorrect)
@@ -277,22 +340,18 @@ public class SequenceTotemPuzzleManager : BasePuzzleManager
                 GameplayTelemetry.Instance.LogAttemptNumber(nextAttemptNumber);
             }
 
-            puzzleStartTime = Time.time;
+            questionStartTime = Time.time;
 
             if (questionAttemptsRemaining <= 0)
-            {
                 StartCoroutine(HandleQuestionFailedSequence());
-            }
             else
-            {
                 ShowFeedback("Incorrect degree!\nTry rotating again.", false, false);
-            }
         }
     }
 
     private IEnumerator HandleQuestionFailedSequence()
     {
-        isProcessingAction = true;
+        isSubmitting = true;
 
         if (closePanelButton != null) closePanelButton.interactable = false;
         if (submitButton != null) submitButton.interactable = false;
@@ -306,7 +365,7 @@ public class SequenceTotemPuzzleManager : BasePuzzleManager
         if (closePanelButton != null) closePanelButton.interactable = true;
         if (submitButton != null) submitButton.interactable = true;
 
-        isProcessingAction = false;
+        isSubmitting = false;
         ClosePuzzleManually();
     }
 
@@ -346,7 +405,7 @@ public class SequenceTotemPuzzleManager : BasePuzzleManager
 
     private IEnumerator HandleCorrectAnswerSequence()
     {
-        isProcessingAction = true;
+        isSubmitting = true;
         ShowFeedback("Correct!", true, false);
 
         yield return new WaitForSeconds(feedbackDisplayDuration);
@@ -359,27 +418,29 @@ public class SequenceTotemPuzzleManager : BasePuzzleManager
         }
         else
         {
-            isProcessingAction = false;
+            isSubmitting = false;
             ResetQuestionAttempts();
             DisplayCurrentQuestion();
         }
     }
 
-    protected override void CompletePuzzle()
+    private void CompletePuzzle()
     {
         if (closePanelButton != null) closePanelButton.interactable = false;
-        isPuzzleCompleted = true;
+        isCleared = true;
 
         ShowFeedback("PUZZLE CLEARED!", true, true);
 
-        if (ShopManagers.Instance != null) ShopManagers.Instance.AddStars(1);
-        ProcessRankSuccess(1.0f);
+        if (ShopManagers.Instance != null)
+            ShopManagers.Instance.AddStars(1);
 
-        if (movingWall != null) StartCoroutine(LiftMovingWallRoutine());
+        if (RankManager.Instance != null)
+            RankManager.Instance.ProcessPuzzleSuccess(1.0f);
 
-        TriggerStarRewardSequence(() => {
-            StartCoroutine(AutoCloseAfterDelayRoutine());
-        });
+        if (movingWall != null)
+            StartCoroutine(LiftMovingWallRoutine());
+
+        StartCoroutine(CompletePuzzleSequenceRoutine());
     }
 
     private IEnumerator LiftMovingWallRoutine()
@@ -393,28 +454,111 @@ public class SequenceTotemPuzzleManager : BasePuzzleManager
             movingWall.position = Vector3.MoveTowards(movingWall.position, targetPos, liftSpeed * Time.deltaTime);
             yield return null;
         }
-
         movingWall.position = targetPos;
         isWallMoving = false;
     }
 
-    private IEnumerator AutoCloseAfterDelayRoutine()
+    private IEnumerator CompletePuzzleSequenceRoutine()
     {
+        bool isStarAnimationDone = false;
+        TriggerStarRewardSequence(() => isStarAnimationDone = true);
+
+        float timeoutTimer = 0f;
+        while (!isStarAnimationDone && timeoutTimer < 2.0f)
+        {
+            timeoutTimer += Time.deltaTime;
+            yield return null;
+        }
+
         yield return new WaitForSeconds(0.5f);
         ClosePuzzleManually();
     }
 
+    private void TriggerStarRewardSequence(Action onComplete)
+    {
+        if (starRewardAnimator != null)
+        {
+            if (!starRewardAnimator.gameObject.activeInHierarchy)
+                starRewardAnimator.gameObject.SetActive(true);
+
+            if (targetStarSlot != null)
+                starRewardAnimator.PlayStarRewardSequence(targetStarSlot, () => onComplete?.Invoke());
+            else
+                starRewardAnimator.PlayStarRewardSequence(() => onComplete?.Invoke());
+        }
+        else onComplete?.Invoke();
+    }
+
+    // ── HINT SYSTEM ─────────────────────────────────────────────────────────
+    public void CheckAndUnlockHint()
+    {
+        if (ShopManagers.Instance != null && ShopManagers.Instance.hasHintScroll && !isCleared)
+            EnableHintButton();
+        else
+            DisableHintButton();
+    }
+
+    public void EnableHintButton()
+    {
+        if (isCleared) return;
+        if (hintScrollUI == null) return;
+
+        hintScrollUI.gameObject.SetActive(true);
+        hintScrollUI.EnableHint(() =>
+        {
+            if (ShopManagers.Instance != null)
+                ShopManagers.Instance.UseHintScroll();
+
+            ShowHintExplanation();
+            DisableHintButton();
+        });
+    }
+
+    public void DisableHintButton()
+    {
+        if (hintScrollUI != null)
+            hintScrollUI.gameObject.SetActive(false);
+    }
+
+    private void ShowHintExplanation()
+    {
+        if (activeSessionPuzzles.Count < 3) return;
+        if (currentQuestionIndex < 0 || currentQuestionIndex >= activeSessionPuzzles.Count) return;
+
+        hintUsedThisPuzzle = true;
+
+        if (hintExplanationPanel != null)
+            hintExplanationPanel.SetActive(true);
+
+        string hintText = activeSessionPuzzles[currentQuestionIndex].hint;
+        if (string.IsNullOrWhiteSpace(hintText))
+            hintText = "Read the question carefully and think about the geometry rule involved.";
+
+        if (hintExplanationText != null)
+            hintExplanationText.text = hintText;
+    }
+
+    public void HideHintExplanation()
+    {
+        if (hintExplanationPanel != null)
+            hintExplanationPanel.SetActive(false);
+    }
+    // ────────────────────────────────────────────────────────────────────────
+
     public void ResetPuzzleForReplay()
     {
-        isPuzzleCompleted = false;
+        isCleared = false;
         datasetLoaded = false;
-        isProcessingAction = false;
+        isSubmitting = false;
         currentQuestionIndex = 0;
+        hintUsedThisPuzzle = false;
 
         if (movingWall != null) movingWall.position = initialWallPosition;
         if (closePanelButton != null) closePanelButton.interactable = true;
 
         HideFeedback();
+        HideHintExplanation();
+        DisableHintButton();
         CloseQuestionPanel();
         ResetQuestionAttempts();
         PrepareSessionQuestions();
@@ -423,12 +567,17 @@ public class SequenceTotemPuzzleManager : BasePuzzleManager
     public void ClosePuzzleManually()
     {
         StopAllCoroutines();
-        isProcessingAction = false;
+        isSubmitting = false;
 
-        if (questionAttemptsRemaining <= 0) ResetQuestionAttempts();
+        if (questionAttemptsRemaining <= 0)
+            ResetQuestionAttempts();
+
+        if (playerControlsCanvas != null)
+            playerControlsCanvas.SetActive(true);
 
         HideFeedback();
+        HideHintExplanation();
         CloseQuestionPanel();
-        ClosePuzzle();
+        gameObject.SetActive(false);
     }
 }
