@@ -5,11 +5,7 @@ using TMPro;
 using System.Collections;
 using System.Collections.Generic;
 
-/// <summary>
-/// Manages grid-based word search geometry puzzles, extending BasePuzzleManager
-/// to reuse swipe path input mapping, hint sliding transitions, and star awards.
-/// </summary>
-public class GeoWordPlayManager : BasePuzzleManager
+public class GeoWordPlayManager : MonoBehaviour
 {
     [Header("UI Data Tracking Links")]
     public TextMeshProUGUI txtAttempts;
@@ -24,12 +20,26 @@ public class GeoWordPlayManager : BasePuzzleManager
     public GameObject iconWrong;
     public float feedbackDisplayTime = 1.2f;
 
-    [Header("Hint UI Elements")]
+    [Header("Player Kit UI Settings")]
+    public GameObject playerKitCanvas;
+
+    [Header("Player Control Safety Unfreeze")]
+    public MonoBehaviour playerMovementScript;
+
+    // ── LEGACY HINT UI (kept for backward compat) ──────────────────────────
+    [Header("Legacy Hint UI (optional — prefer Hint Panel below)")]
     public Button btnHint;
     public GameObject hintUI;
     public TextMeshProUGUI txtHintText;
     public Button btnCloseHint;
     public float hintAnimDuration = 0.3f;
+
+    // ── HINT PANEL (separate canvas — reads only the 'hint' field) ─────────
+    [Header("Hint Panel (separate canvas — reads only the 'hint' field)")]
+    public HintScrollUI hintScrollUI;
+    public GameObject hintExplanationPanel;
+    public TMP_Text hintExplanationText;
+    public Button hintGotItButton;
 
     [Header("Moving Wall / Gate Settings")]
     [SerializeField] private bool useMovingWall = false;
@@ -44,11 +54,22 @@ public class GeoWordPlayManager : BasePuzzleManager
     public Transform gridContainer;
     public GameObject btnLetterPrefab;
 
-    [Header("Visual Feedback Colors")]
+    [Header("Star Reward Controller")]
+    public StarRewardAnimation starRewardAnimator;
+    public RectTransform targetStarSlot;
+
+    [Header("Visual Feedback Settings")]
     public Color colorDefaultInput = Color.white;
     public Color colorCorrectInput = new Color(0f, 0.96f, 0.63f, 1f);
     public Color colorWrongInput = new Color(1f, 0.42f, 0.42f, 1f);
     public Color colorSwipedBtn = new Color(0.5f, 0.5f, 0.5f, 1f);
+
+    public float shakeDuration = 0.35f;
+    public float shakeMagnitude = 8f;
+
+    [HideInInspector]
+    public bool isCleared = false;
+    private bool hintUsedThisPuzzle = false;
 
     private const int gridWidth = 7;
     private const int gridHeight = 7;
@@ -60,16 +81,22 @@ public class GeoWordPlayManager : BasePuzzleManager
 
     private string playerCurrentInput = "";
     private int wordsSolvedCount = 0;
+
     private int attemptsLeft = 3;
     private const int maxAttempts = 3;
+
     private string fillerPool = "abcdefghijklmnopqrstuvwxyz";
 
     private List<GeoGridSwipe> selectedPath = new List<GeoGridSwipe>();
     private bool isSwiping = false;
 
+    private bool isProcessingAnswer = false;
+    private float questionStartTime = 0f;
     private Vector3 originalAttemptsPosition;
     private Vector3 initialWallPosition;
+    private Coroutine attemptsShakeCoroutine;
     private Coroutine flashInputCoroutine;
+    private Coroutine hintAnimCoroutine;
     private Coroutine feedbackCoroutine;
 
     private RectTransform hintRectTransform;
@@ -78,22 +105,22 @@ public class GeoWordPlayManager : BasePuzzleManager
     private List<RaycastResult> raycastResults = new List<RaycastResult>();
     private PointerEventData cachedPointerEventData;
 
-    protected override void Awake()
+    void Awake()
     {
-        base.Awake();
-
         if (movingWall != null) initialWallPosition = movingWall.position;
 
         dataSetLoader = GetComponent<GeoWordDataSet>();
         if (dataSetLoader == null) dataSetLoader = gameObject.AddComponent<GeoWordDataSet>();
         dataSetLoader.LoadData();
 
-        if (txtAttempts != null) originalAttemptsPosition = txtAttempts.rectTransform.anchoredPosition;
+        if (txtAttempts != null)
+            originalAttemptsPosition = txtAttempts.rectTransform.anchoredPosition;
 
         if (hintUI != null)
         {
             hintRectTransform = hintUI.GetComponent<RectTransform>();
-            if (hintRectTransform != null) hintOriginalAnchoredPos = hintRectTransform.anchoredPosition;
+            if (hintRectTransform != null)
+                hintOriginalAnchoredPos = hintRectTransform.anchoredPosition;
         }
 
         if (btnSubmit != null)
@@ -113,19 +140,25 @@ public class GeoWordPlayManager : BasePuzzleManager
             btnCloseHint.onClick.RemoveAllListeners();
             btnCloseHint.onClick.AddListener(CloseHintUI);
         }
+
+        if (hintGotItButton != null)
+            hintGotItButton.onClick.AddListener(HideHintExplanation);
     }
 
     void Update()
     {
         if (!isSwiping) return;
 
-        if (Input.GetMouseButtonUp(0) || (Input.touchCount > 0 && Input.GetTouch(0).phase == TouchPhase.Ended))
+        if (Input.GetMouseButtonUp(0) ||
+            (Input.touchCount > 0 && Input.GetTouch(0).phase == TouchPhase.Ended))
         {
             OnSwipeEnd();
             return;
         }
 
-        Vector2 pointerPos = Input.touchCount > 0 ? Input.GetTouch(0).position : (Vector2)Input.mousePosition;
+        Vector2 pointerPos = Input.touchCount > 0
+            ? Input.GetTouch(0).position
+            : (Vector2)Input.mousePosition;
 
         if (EventSystem.current == null) return;
         if (cachedPointerEventData == null) cachedPointerEventData = new PointerEventData(EventSystem.current);
@@ -154,17 +187,22 @@ public class GeoWordPlayManager : BasePuzzleManager
 
     private IEnumerator StartPuzzleSystemRoutine()
     {
-        while (!dataSetLoader.isLoaded) yield return null;
+        while (!dataSetLoader.isLoaded)
+            yield return null;
 
-        isPuzzleCompleted = false;
-        isProcessingAction = false;
+        isCleared = false;
+        isProcessingAnswer = false;
         isSwiping = false;
         wordsSolvedCount = 0;
         attemptsLeft = maxAttempts;
+        hintUsedThisPuzzle = false;
 
         HideFeedback();
-        OpenPuzzle();
+        HideHintExplanation();
+        DisableHintButton();
+        SetPlayerMovementState(false);
 
+        if (playerKitCanvas != null) playerKitCanvas.SetActive(false);
         if (gridContainer != null) gridContainer.gameObject.SetActive(true);
         if (hintUI != null) hintUI.SetActive(false);
 
@@ -174,7 +212,7 @@ public class GeoWordPlayManager : BasePuzzleManager
     void Initialize3WordPuzzle()
     {
         playerCurrentInput = "";
-        isProcessingAction = false;
+        isProcessingAnswer = false;
         isSwiping = false;
 
         if (txtCurrentInput != null)
@@ -192,21 +230,21 @@ public class GeoWordPlayManager : BasePuzzleManager
         SelectThreeTargetQuestions();
         UpdateActiveQuestionPrompt();
 
-        string puzzleTopic = (GameManager.Instance != null && !string.IsNullOrEmpty(GameManager.Instance.currentCategory))
-            ? GameManager.Instance.currentCategory
-            : "Geometry Vocabulary";
-
-        int diffLevel = currentDifficulty.ToLower() == "hard" ? 3 : (currentDifficulty.ToLower() == "medium" ? 2 : 1);
-        LogPuzzleStart(puzzleTopic, diffLevel);
-        
         if (GameplayTelemetry.Instance != null)
         {
+            string puzzleTopic = (GameManager.Instance != null && !string.IsNullOrEmpty(GameManager.Instance.currentCategory))
+                ? GameManager.Instance.currentCategory
+                : "Geometry Vocabulary";
+
+            int diffLevel = currentDifficulty.ToLower() == "hard" ? 3 : (currentDifficulty.ToLower() == "medium" ? 2 : 1);
+            GameplayTelemetry.Instance.BeginPuzzle(puzzleTopic, diffLevel);
             GameplayTelemetry.Instance.LogQuestionTier(diffLevel);
             GameplayTelemetry.Instance.LogAttemptNumber(maxAttempts - attemptsLeft + 1);
         }
 
-        puzzleStartTime = Time.time;
+        questionStartTime = Time.time;
         BuildWordSearchGrid();
+        CheckAndUnlockHint();
     }
 
     void SelectThreeTargetQuestions()
@@ -219,13 +257,13 @@ public class GeoWordPlayManager : BasePuzzleManager
         List<GeoWordDataSet.QuestionData> pool = dataSetLoader.Database.questions.FindAll(
             q => q.difficulty.ToLower() == currentDifficulty.ToLower()
                  && q.answer.Trim().Length <= gridWidth
-                 && q.answer.Trim().Length >= 3
-        );
+                 && q.answer.Trim().Length >= 3);
 
         if (pool.Count < 3)
         {
             pool = dataSetLoader.Database.questions.FindAll(
-                q => q.answer.Trim().Length <= gridWidth && q.answer.Trim().Length >= 3);
+                q => q.answer.Trim().Length <= gridWidth
+                     && q.answer.Trim().Length >= 3);
         }
 
         for (int i = 0; i < pool.Count; i++)
@@ -246,17 +284,17 @@ public class GeoWordPlayManager : BasePuzzleManager
     private int GetCurrentActiveQuestionIndex()
     {
         for (int i = 0; i < activeQuestions.Count; i++)
-        {
             if (!answerSolvedStatus[i]) return i;
-        }
         return -1;
     }
 
     void UpdateActiveQuestionPrompt()
     {
         if (txtQuestion == null) return;
+
         int currentIndex = GetCurrentActiveQuestionIndex();
-        if (currentIndex != -1) txtQuestion.text = activeQuestions[currentIndex].prompt;
+        if (currentIndex != -1)
+            txtQuestion.text = activeQuestions[currentIndex].prompt;
     }
 
     public void DisplayFeedback(string message, bool isCorrect)
@@ -290,15 +328,23 @@ public class GeoWordPlayManager : BasePuzzleManager
         if (txtFeedback != null) txtFeedback.text = "";
     }
 
+    // ── HINT SYSTEM ─────────────────────────────────────────────────────────
+
+    // Legacy path (kept for the old hintUI prefab if it's still in the scene).
     public void ShowCurrentHint()
     {
         int currentIndex = GetCurrentActiveQuestionIndex();
-        if (currentIndex != -1 && txtHintText != null && hintRectTransform != null)
-        {
+        if (currentIndex == -1) return;
+
+        hintUsedThisPuzzle = true;
+
+        if (txtHintText != null)
             txtHintText.text = activeQuestions[currentIndex].hint;
-            if (panelAnimCoroutine != null) StopCoroutine(panelAnimCoroutine);
-            hintUI.SetActive(true);
-            panelAnimCoroutine = StartCoroutine(SlidePanelInRoutine(hintRectTransform, hintAnimDuration));
+
+        if (hintUI != null && hintRectTransform != null)
+        {
+            if (hintAnimCoroutine != null) StopCoroutine(hintAnimCoroutine);
+            hintAnimCoroutine = StartCoroutine(SlideInHintUI());
         }
     }
 
@@ -306,29 +352,135 @@ public class GeoWordPlayManager : BasePuzzleManager
     {
         if (hintUI != null && hintUI.activeSelf && hintRectTransform != null)
         {
-            if (panelAnimCoroutine != null) StopCoroutine(panelAnimCoroutine);
-            panelAnimCoroutine = StartCoroutine(SlidePanelOutRoutine(hintRectTransform, hintUI, hintAnimDuration));
+            if (hintAnimCoroutine != null) StopCoroutine(hintAnimCoroutine);
+            hintAnimCoroutine = StartCoroutine(SlideOutHintUI());
         }
     }
 
+    private IEnumerator SlideInHintUI()
+    {
+        hintUI.SetActive(true);
+
+        float offscreenX = Screen.width;
+        if (hintRectTransform.parent != null)
+            offscreenX = ((RectTransform)hintRectTransform.parent).rect.width;
+
+        Vector2 startPos = new Vector2(offscreenX, hintOriginalAnchoredPos.y);
+        Vector2 targetPos = hintOriginalAnchoredPos;
+        hintRectTransform.anchoredPosition = startPos;
+
+        float elapsed = 0f;
+        while (elapsed < hintAnimDuration)
+        {
+            elapsed += Time.deltaTime;
+            float t = elapsed / hintAnimDuration;
+            t = t * t * (3f - 2f * t);
+            hintRectTransform.anchoredPosition = Vector2.Lerp(startPos, targetPos, t);
+            yield return null;
+        }
+        hintRectTransform.anchoredPosition = targetPos;
+    }
+
+    private IEnumerator SlideOutHintUI()
+    {
+        float offscreenX = Screen.width;
+        if (hintRectTransform.parent != null)
+            offscreenX = ((RectTransform)hintRectTransform.parent).rect.width;
+
+        Vector2 startPos = hintRectTransform.anchoredPosition;
+        Vector2 targetPos = new Vector2(offscreenX, hintOriginalAnchoredPos.y);
+
+        float elapsed = 0f;
+        while (elapsed < hintAnimDuration)
+        {
+            elapsed += Time.deltaTime;
+            float t = elapsed / hintAnimDuration;
+            t = t * t * (3f - 2f * t);
+            hintRectTransform.anchoredPosition = Vector2.Lerp(startPos, targetPos, t);
+            yield return null;
+        }
+        hintRectTransform.anchoredPosition = targetPos;
+        hintUI.SetActive(false);
+    }
+
+    // New HintScrollUI-based path — matches the other two puzzles.
+    public void CheckAndUnlockHint()
+    {
+        if (ShopManagers.Instance != null && ShopManagers.Instance.hasHintScroll && !isCleared)
+            EnableHintButton();
+        else
+            DisableHintButton();
+    }
+
+    public void EnableHintButton()
+    {
+        if (isCleared) return;
+        if (hintScrollUI == null) return;
+
+        hintScrollUI.gameObject.SetActive(true);
+        hintScrollUI.EnableHint(() =>
+        {
+            if (ShopManagers.Instance != null)
+                ShopManagers.Instance.UseHintScroll();
+
+            ShowHintExplanation();
+            DisableHintButton();
+        });
+    }
+
+    public void DisableHintButton()
+    {
+        if (hintScrollUI != null)
+            hintScrollUI.gameObject.SetActive(false);
+    }
+
+    private void ShowHintExplanation()
+    {
+        int idx = GetCurrentActiveQuestionIndex();
+        if (idx == -1) return;
+
+        hintUsedThisPuzzle = true;
+
+        if (hintExplanationPanel != null)
+            hintExplanationPanel.SetActive(true);
+
+        string hintText = activeQuestions[idx].hint;
+        if (string.IsNullOrWhiteSpace(hintText))
+            hintText = "Read the definition carefully and match it to the correct geometry term.";
+
+        if (hintExplanationText != null)
+            hintExplanationText.text = hintText;
+    }
+
+    public void HideHintExplanation()
+    {
+        if (hintExplanationPanel != null)
+            hintExplanationPanel.SetActive(false);
+    }
+    // ────────────────────────────────────────────────────────────────────────
+
     void BuildWordSearchGrid()
     {
-        if (gridContainer == null || btnLetterPrefab == null) return;
+        if (gridContainer == null || btnLetterPrefab == null)
+        {
+            Debug.LogError("GeoWordPlayManager fields missing!");
+            return;
+        }
 
         foreach (Transform child in gridContainer) Destroy(child.gameObject);
 
         bool allPlaced = false;
         int rebuildAttempts = 0;
+        const int maxRebuildAttempts = 20;
 
-        while (!allPlaced && rebuildAttempts < 20)
+        while (!allPlaced && rebuildAttempts < maxRebuildAttempts)
         {
             rebuildAttempts++;
             allPlaced = true;
 
             for (int x = 0; x < gridWidth; x++)
-            {
-                for (int y = 0; y < gridHeight; y++) gridMatrix[x, y] = ' ';
-            }
+                for (int y = 0; y < gridHeight; y++)
+                    gridMatrix[x, y] = ' ';
 
             foreach (var q in activeQuestions)
             {
@@ -347,33 +499,43 @@ public class GeoWordPlayManager : BasePuzzleManager
         {
             for (int x = 0; x < gridWidth; x++)
             {
-                if (gridMatrix[x, y] == ' ') gridMatrix[x, y] = fillerPool[Random.Range(0, fillerPool.Length)];
+                if (gridMatrix[x, y] == ' ')
+                    gridMatrix[x, y] = fillerPool[Random.Range(0, fillerPool.Length)];
 
                 GameObject setupButton = Instantiate(btnLetterPrefab, gridContainer);
                 TextMeshProUGUI keyDisplayField = setupButton.GetComponentInChildren<TextMeshProUGUI>();
 
                 char letter = gridMatrix[x, y];
-                if (keyDisplayField != null) keyDisplayField.text = letter.ToString().ToUpper();
+                if (keyDisplayField != null)
+                    keyDisplayField.text = letter.ToString().ToUpper();
 
                 GeoGridSwipe swipeLetter = setupButton.GetComponent<GeoGridSwipe>();
                 if (swipeLetter == null) swipeLetter = setupButton.AddComponent<GeoGridSwipe>();
                 swipeLetter.Setup(x, y, letter.ToString().ToLower().Trim(), this);
+
+                Button baseBtn = setupButton.GetComponent<Button>();
+                if (baseBtn != null) baseBtn.onClick.RemoveAllListeners();
             }
         }
     }
 
     private bool TryPlaceWord(string word)
     {
-        for (int attempt = 0; attempt < 200; attempt++)
+        const int placementAttempts = 200;
+
+        for (int attempt = 0; attempt < placementAttempts; attempt++)
         {
             int dir = Random.Range(0, 2);
+
             if (dir == 0 && word.Length <= gridWidth)
             {
                 int startX = Random.Range(0, gridWidth - word.Length + 1);
                 int startY = Random.Range(0, gridHeight);
+
                 if (CanPlaceWord(word, startX, startY, true))
                 {
-                    for (int i = 0; i < word.Length; i++) gridMatrix[startX + i, startY] = word[i];
+                    for (int i = 0; i < word.Length; i++)
+                        gridMatrix[startX + i, startY] = word[i];
                     return true;
                 }
             }
@@ -381,9 +543,11 @@ public class GeoWordPlayManager : BasePuzzleManager
             {
                 int startX = Random.Range(0, gridWidth);
                 int startY = Random.Range(0, gridHeight - word.Length + 1);
+
                 if (CanPlaceWord(word, startX, startY, false))
                 {
-                    for (int i = 0; i < word.Length; i++) gridMatrix[startX, startY + i] = word[i];
+                    for (int i = 0; i < word.Length; i++)
+                        gridMatrix[startX, startY + i] = word[i];
                     return true;
                 }
             }
@@ -395,8 +559,12 @@ public class GeoWordPlayManager : BasePuzzleManager
     {
         for (int i = 0; i < word.Length; i++)
         {
-            char existing = horizontal ? gridMatrix[startX + i, startY] : gridMatrix[startX, startY + i];
-            if (existing != ' ' && existing != word[i]) return false;
+            char existing = horizontal
+                ? gridMatrix[startX + i, startY]
+                : gridMatrix[startX, startY + i];
+
+            if (existing != ' ' && existing != word[i])
+                return false;
         }
         return true;
     }
@@ -405,7 +573,8 @@ public class GeoWordPlayManager : BasePuzzleManager
 
     public void OnSwipeStart(GeoGridSwipe cell)
     {
-        if (isProcessingAction || cell == null) return;
+        if (isProcessingAnswer || cell == null) return;
+
         HideFeedback();
         ClearSwipeHighlights();
         selectedPath.Clear();
@@ -415,7 +584,7 @@ public class GeoWordPlayManager : BasePuzzleManager
 
     public void OnSwipeDragEnter(GeoGridSwipe cell)
     {
-        if (!isSwiping || cell == null || isProcessingAction) return;
+        if (!isSwiping || cell == null || isProcessingAnswer) return;
 
         if (selectedPath.Count == 0)
         {
@@ -434,11 +603,8 @@ public class GeoWordPlayManager : BasePuzzleManager
 
         if (selectedPath.Contains(cell)) return;
 
-        if (Mathf.Abs(selectedPath[selectedPath.Count - 1].gridX - cell.gridX) <= 1 &&
-            Mathf.Abs(selectedPath[selectedPath.Count - 1].gridY - cell.gridY) <= 1)
-        {
+        if (IsAdjacent(selectedPath[selectedPath.Count - 1], cell))
             AddCellToSwipePath(cell);
-        }
     }
 
     public void OnSwipeEnd()
@@ -446,6 +612,13 @@ public class GeoWordPlayManager : BasePuzzleManager
         if (!isSwiping) return;
         isSwiping = false;
         RebuildCurrentInputFromPath();
+    }
+
+    private bool IsAdjacent(GeoGridSwipe a, GeoGridSwipe b)
+    {
+        int deltaX = Mathf.Abs(a.gridX - b.gridX);
+        int deltaY = Mathf.Abs(a.gridY - b.gridY);
+        return deltaX <= 1 && deltaY <= 1;
     }
 
     private void AddCellToSwipePath(GeoGridSwipe cell)
@@ -460,18 +633,43 @@ public class GeoWordPlayManager : BasePuzzleManager
     {
         playerCurrentInput = "";
         foreach (var cell in selectedPath)
-        {
             if (cell != null) playerCurrentInput += cell.letter.ToLower().Trim();
-        }
-        if (txtCurrentInput != null) txtCurrentInput.text = playerCurrentInput.ToUpper();
+
+        if (txtCurrentInput != null)
+            txtCurrentInput.text = playerCurrentInput.ToUpper();
     }
 
     private void ClearSwipeHighlights()
     {
         foreach (var cell in selectedPath)
-        {
             if (cell != null) cell.ResetColor();
+    }
+
+    IEnumerator AnimateButtonPunch(Transform btnTransform)
+    {
+        if (btnTransform == null) yield break;
+
+        Vector3 originalScale = Vector3.one;
+        Vector3 pressedScale = originalScale * 0.85f;
+
+        float elapsed = 0f;
+        float pressDuration = 0.04f;
+        while (elapsed < pressDuration)
+        {
+            elapsed += Time.deltaTime;
+            btnTransform.localScale = Vector3.Lerp(originalScale, pressedScale, elapsed / pressDuration);
+            yield return null;
         }
+
+        elapsed = 0f;
+        float bounceDuration = 0.08f;
+        while (elapsed < bounceDuration)
+        {
+            elapsed += Time.deltaTime;
+            btnTransform.localScale = Vector3.Lerp(pressedScale, originalScale, elapsed / bounceDuration);
+            yield return null;
+        }
+        btnTransform.localScale = originalScale;
     }
 
     public void ClearCurrentInput()
@@ -480,6 +678,7 @@ public class GeoWordPlayManager : BasePuzzleManager
         playerCurrentInput = "";
         ClearSwipeHighlights();
         selectedPath.Clear();
+
         if (txtCurrentInput != null)
         {
             txtCurrentInput.text = "";
@@ -489,10 +688,10 @@ public class GeoWordPlayManager : BasePuzzleManager
 
     public void SubmitCurrentInput()
     {
-        if (isProcessingAction || string.IsNullOrEmpty(playerCurrentInput)) return;
-        isProcessingAction = true;
+        if (isProcessingAnswer || string.IsNullOrEmpty(playerCurrentInput)) return;
+        isProcessingAnswer = true;
 
-        float timeSpent = Time.time - puzzleStartTime;
+        float timeSpent = Time.time - questionStartTime;
         string cleanedInput = playerCurrentInput.Trim().ToLower();
         int currentIndex = GetCurrentActiveQuestionIndex();
         bool isCorrect = false;
@@ -503,8 +702,17 @@ public class GeoWordPlayManager : BasePuzzleManager
             if (targetAnswer == cleanedInput) isCorrect = true;
         }
 
-        LogPuzzleAttempt(isCorrect, timeSpent);
-        TrackQuestionMetrics(activeQuestions[currentIndex].prompt, 1, isCorrect, timeSpent);
+        if (GameplayTelemetry.Instance != null)
+        {
+            GameplayTelemetry.Instance.LogAttemptNumber(maxAttempts - attemptsLeft + 1);
+            GameplayTelemetry.Instance.LogAttempt(isCorrect, timeSpent, hintUsedThisPuzzle);
+        }
+
+        if (GameManager.Instance != null && currentIndex != -1)
+        {
+            string currentPrompt = activeQuestions[currentIndex].prompt;
+            GameManager.Instance.TrackQuestionPerformance(currentPrompt, 1, isCorrect, timeSpent);
+        }
 
         if (isCorrect)
         {
@@ -512,49 +720,67 @@ public class GeoWordPlayManager : BasePuzzleManager
             wordsSolvedCount++;
 
             DisplayFeedback($"CORRECT! Solved: {activeQuestions[currentIndex].answer.ToUpper()}", true);
-            StartFlashInput(colorCorrectInput, 0.25f, () => {
+
+            StartFlashInput(colorCorrectInput, 0.25f, () =>
+            {
                 UpdateActiveQuestionPrompt();
                 ClearCurrentInput();
                 attemptsLeft = maxAttempts;
+                hintUsedThisPuzzle = false;
 
                 if (wordsSolvedCount >= 3)
                 {
-                    isPuzzleCompleted = true;
-                    if (txtQuestion != null) txtQuestion.text = "<color=#00F5A0>ALL 3 GEOMETRY PUZZLES SOLVED!</color>";
-                    
-                    if (ShopManagers.Instance != null) ShopManagers.Instance.AddStars(1);
-                    ProcessRankSuccess(1.0f);
+                    isCleared = true;
 
-                    if (useMovingWall && movingWall != null) StartCoroutine(LiftMovingWallRoutine());
+                    if (txtQuestion != null)
+                        txtQuestion.text = "<color=#00F5A0>ALL 3 GEOMETRY PUZZLES SOLVED!</color>";
 
-                    TriggerStarRewardSequence(() => StartCoroutine(AutoCloseAfterDelay()));
+                    if (ShopManagers.Instance != null)
+                        ShopManagers.Instance.AddStars(1);
+
+                    if (RankManager.Instance != null)
+                        RankManager.Instance.ProcessPuzzleSuccess(1.0f);
+
+                    if (useMovingWall && movingWall != null)
+                        StartCoroutine(LiftMovingWallRoutine());
+
+                    TriggerStarRewardSequence();
                 }
                 else
                 {
-                    puzzleStartTime = Time.time;
-                    isProcessingAction = false;
+                    questionStartTime = Time.time;
+                    isProcessingAnswer = false;
+                    if (GameplayTelemetry.Instance != null)
+                        GameplayTelemetry.Instance.LogAttemptNumber(1);
+
+                    CheckAndUnlockHint();
                 }
             });
         }
         else
         {
             attemptsLeft--;
-            DisplayFeedback("INCORRECT WORD ALIGNMENT. TRY AGAIN!", false);
-            StartCoroutine(ShakeRectTransformRoutine(txtAttempts.rectTransform, defaultShakeDuration, defaultShakeMagnitude));
 
-            StartFlashInput(colorWrongInput, 0.4f, () => {
+            DisplayFeedback("INCORRECT WORD ALIGNMENT. TRY AGAIN!", false);
+
+            VibrateAttemptsText();
+            StartFlashInput(colorWrongInput, 0.4f, () =>
+            {
                 if (attemptsLeft <= 0)
                 {
                     if (txtAttempts != null) txtAttempts.text = "ATTEMPTS: 0";
-                    if (txtQuestion != null) txtQuestion.text = "<color=#FF6B6B>PUZZLE LOCKED. CLOSING AUTOMATICALLY.</color>";
+                    if (txtQuestion != null)
+                        txtQuestion.text = "<color=#FF6B6B>PUZZLE LOCKED. CLOSING AUTOMATICALLY.</color>";
                     StartCoroutine(AutoCloseAfterDelay());
                 }
                 else
                 {
                     if (txtAttempts != null) txtAttempts.text = $"ATTEMPTS: {attemptsLeft}";
                     ClearCurrentInput();
-                    puzzleStartTime = Time.time;
-                    isProcessingAction = false;
+                    questionStartTime = Time.time;
+                    isProcessingAnswer = false;
+                    if (GameplayTelemetry.Instance != null)
+                        GameplayTelemetry.Instance.LogAttemptNumber(maxAttempts - attemptsLeft + 1);
                 }
             });
         }
@@ -564,12 +790,36 @@ public class GeoWordPlayManager : BasePuzzleManager
     {
         Vector3 startPos = movingWall.position;
         Vector3 targetPos = startPos + Vector3.up * targetRiseHeight;
+
         while (Vector3.Distance(movingWall.position, targetPos) > 0.01f)
         {
             movingWall.position = Vector3.MoveTowards(movingWall.position, targetPos, liftSpeed * Time.deltaTime);
             yield return null;
         }
         movingWall.position = targetPos;
+    }
+
+    void VibrateAttemptsText()
+    {
+        if (txtAttempts == null) return;
+        if (attemptsShakeCoroutine != null) StopCoroutine(attemptsShakeCoroutine);
+        attemptsShakeCoroutine = StartCoroutine(ShakeAttemptsTextRoutine());
+    }
+
+    IEnumerator ShakeAttemptsTextRoutine()
+    {
+        RectTransform rectTransform = txtAttempts.rectTransform;
+        float elapsed = 0f;
+
+        while (elapsed < shakeDuration)
+        {
+            elapsed += Time.deltaTime;
+            float offsetX = Random.Range(-shakeMagnitude, shakeMagnitude);
+            float offsetY = Random.Range(-shakeMagnitude, shakeMagnitude);
+            rectTransform.anchoredPosition = originalAttemptsPosition + new Vector3(offsetX, offsetY, 0f);
+            yield return null;
+        }
+        rectTransform.anchoredPosition = originalAttemptsPosition;
     }
 
     void StartFlashInput(Color flashColor, float duration, System.Action onComplete)
@@ -586,6 +836,18 @@ public class GeoWordPlayManager : BasePuzzleManager
         onComplete?.Invoke();
     }
 
+    void TriggerStarRewardSequence()
+    {
+        if (starRewardAnimator != null)
+        {
+            if (targetStarSlot != null)
+                starRewardAnimator.PlayStarRewardSequence(targetStarSlot, () => StartCoroutine(AutoCloseAfterDelay()));
+            else
+                starRewardAnimator.PlayStarRewardSequence(() => StartCoroutine(AutoCloseAfterDelay()));
+        }
+        else StartCoroutine(AutoCloseAfterDelay());
+    }
+
     IEnumerator AutoCloseAfterDelay()
     {
         yield return new WaitForSeconds(0.5f);
@@ -595,7 +857,19 @@ public class GeoWordPlayManager : BasePuzzleManager
     public void ClosePuzzleManually()
     {
         ClearCurrentInput();
-        isProcessingAction = false;
-        ClosePuzzle();
+        isProcessingAnswer = false;
+
+        HideHintExplanation();
+        DisableHintButton();
+
+        SetPlayerMovementState(true);
+        if (playerKitCanvas != null) playerKitCanvas.SetActive(true);
+
+        gameObject.SetActive(false);
+    }
+
+    private void SetPlayerMovementState(bool state)
+    {
+        if (playerMovementScript != null) playerMovementScript.enabled = state;
     }
 }
